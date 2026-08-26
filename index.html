@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OpenCall</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ground:#10141c;
+  --panel:#171d28;
+  --panel-2:#1f2735;
+  --line:#2a3444;
+  --text:#e6e9ef;
+  --muted:#8494ab;
+  --signal:#f5a524;
+  --live:#3dd9a4;
+  --drop:#ff6b5b;
+
+  --display:"Bricolage Grotesque",system-ui,sans-serif;
+  --body:"Inter",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,monospace;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--ground);
+  color:var(--text);
+  font-family:var(--body);
+  font-size:15px;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  overflow:hidden;
+}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+button:focus-visible,input:focus-visible,select:focus-visible{
+  outline:2px solid var(--signal);outline-offset:2px;
+}
+
+/* ---------------------------------------------------------- preflight */
+
+#preflight{
+  height:100%;
+  display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(320px,420px);
+}
+@media (max-width:860px){
+  #preflight{grid-template-columns:1fr;grid-template-rows:auto 1fr;overflow-y:auto}
+}
+
+.stage{
+  position:relative;
+  display:flex;align-items:center;justify-content:center;
+  padding:32px;
+  background:
+    radial-gradient(120% 90% at 50% 0%, #1a2130 0%, var(--ground) 70%);
+}
+.preview-frame{
+  position:relative;
+  width:100%;max-width:620px;aspect-ratio:16/10;
+  border-radius:18px;overflow:hidden;
+  background:var(--panel);
+  border:1px solid var(--line);
+}
+.preview-frame video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+.preview-frame.off video{opacity:0}
+.preview-empty{
+  position:absolute;inset:0;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:12px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--muted);
+}
+.preview-frame:not(.off) .preview-empty{display:none}
+
+/* mic level bars, bottom-left of preview */
+.levels{
+  position:absolute;left:16px;bottom:16px;
+  display:flex;align-items:flex-end;gap:3px;height:22px;
+  padding:8px 10px;border-radius:10px;
+  background:rgba(16,20,28,.72);
+  backdrop-filter:blur(8px);
+}
+.levels i{
+  display:block;width:3px;height:4px;border-radius:2px;
+  background:var(--line);transition:height .07s linear,background .07s linear;
+}
+.levels i.on{background:var(--live)}
+
+.panel{
+  background:var(--panel);
+  border-left:1px solid var(--line);
+  padding:40px 34px;
+  display:flex;flex-direction:column;
+  overflow-y:auto;
+}
+@media (max-width:860px){.panel{border-left:none;border-top:1px solid var(--line)}}
+
+.wordmark{
+  font-family:var(--display);
+  font-weight:800;font-size:26px;letter-spacing:-.02em;
+  display:flex;align-items:center;gap:9px;
+}
+.dot{
+  width:9px;height:9px;border-radius:50%;background:var(--signal);
+  box-shadow:0 0 0 0 rgba(245,165,36,.55);
+  animation:beacon 2.4s ease-out infinite;
+}
+@keyframes beacon{
+  0%{box-shadow:0 0 0 0 rgba(245,165,36,.5)}
+  70%{box-shadow:0 0 0 11px rgba(245,165,36,0)}
+  100%{box-shadow:0 0 0 0 rgba(245,165,36,0)}
+}
+.tagline{color:var(--muted);font-size:13.5px;margin-top:10px}
+
+.field{margin-top:26px}
+.label{
+  font-family:var(--mono);font-size:10.5px;font-weight:500;
+  letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+  display:block;margin-bottom:8px;
+}
+input[type=text],select{
+  width:100%;padding:11px 13px;
+  background:var(--panel-2);color:var(--text);
+  border:1px solid var(--line);border-radius:9px;
+  font-family:var(--body);font-size:14.5px;
+}
+select{cursor:pointer}
+
+/* the callsign — the room code, set like a radio channel */
+.callsign{
+  display:flex;gap:8px;align-items:stretch;
+}
+.callsign input{
+  font-family:var(--mono);font-weight:700;font-size:19px;
+  letter-spacing:.16em;text-transform:uppercase;text-align:center;
+}
+.reroll{
+  flex:0 0 46px;
+  border:1px solid var(--line);border-radius:9px;
+  background:var(--panel-2);color:var(--muted);
+  font-size:17px;line-height:1;
+}
+.reroll:hover{color:var(--signal);border-color:var(--signal)}
+
+.toggles{display:flex;gap:10px;margin-top:22px}
+.toggle{
+  flex:1;padding:12px 10px;
+  border:1px solid var(--line);border-radius:11px;
+  background:var(--panel-2);
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--muted);
+  display:flex;flex-direction:column;align-items:center;gap:7px;
+}
+.toggle svg{width:19px;height:19px}
+.toggle.on{color:var(--text);border-color:#3b485c}
+.toggle.off{color:var(--drop);border-color:rgba(255,107,91,.4)}
+
+.enter{
+  margin-top:28px;padding:15px;
+  background:var(--signal);color:#12161d;
+  border-radius:11px;
+  font-family:var(--display);font-weight:700;font-size:16px;
+  letter-spacing:-.01em;
+  transition:filter .15s ease;
+}
+.enter:hover{filter:brightness(1.08)}
+.enter:disabled{opacity:.45;cursor:not-allowed}
+
+.note{
+  margin-top:auto;padding-top:26px;
+  font-family:var(--mono);font-size:11px;line-height:1.75;
+  color:var(--muted);
+}
+.note b{color:var(--text);font-weight:500}
+.err{
+  margin-top:14px;padding:11px 13px;border-radius:9px;
+  background:rgba(255,107,91,.1);border:1px solid rgba(255,107,91,.32);
+  color:var(--drop);font-size:13px;
+}
+
+/* --------------------------------------------------------------- call */
+
+#call{display:none;height:100%;flex-direction:column}
+#call.live{display:flex}
+
+.topbar{
+  display:flex;align-items:center;gap:16px;
+  padding:12px 18px;border-bottom:1px solid var(--line);
+  flex:0 0 auto;
+}
+.channel{
+  font-family:var(--mono);font-weight:700;font-size:14px;
+  letter-spacing:.16em;
+}
+.copy{
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--muted);
+  border:1px solid var(--line);border-radius:7px;padding:6px 11px;
+}
+.copy:hover{color:var(--signal);border-color:var(--signal)}
+.count{
+  margin-left:auto;font-family:var(--mono);font-size:11px;
+  letter-spacing:.1em;color:var(--muted);text-transform:uppercase;
+}
+
+.grid{
+  flex:1;min-height:0;
+  display:grid;gap:10px;padding:10px;
+  grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+  align-content:center;
+}
+.grid[data-n="1"]{grid-template-columns:minmax(0,min(100%,900px));justify-content:center}
+.grid[data-n="2"]{grid-template-columns:repeat(2,minmax(0,1fr))}
+@media (max-width:720px){
+  .grid{grid-template-columns:minmax(0,1fr)!important}
+}
+
+.tile{
+  position:relative;
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:14px;overflow:hidden;
+  aspect-ratio:16/9;min-height:0;
+}
+/* on-air ring: driven by live mic level */
+.tile::after{
+  content:"";position:absolute;inset:0;border-radius:14px;
+  pointer-events:none;
+  box-shadow:inset 0 0 0 2px rgba(245,165,36,calc(var(--level,0)));
+  transition:box-shadow .09s linear;
+}
+.tile video{width:100%;height:100%;object-fit:cover;background:#0c0f15}
+.tile.self video{transform:scaleX(-1)}
+.tile.screen video{object-fit:contain}
+.tile.novideo video{opacity:0}
+
+.avatar{
+  position:absolute;inset:0;display:none;
+  align-items:center;justify-content:center;
+  font-family:var(--display);font-weight:700;font-size:34px;
+  color:var(--muted);
+}
+.tile.novideo .avatar{display:flex}
+
+.tile-foot{
+  position:absolute;left:0;right:0;bottom:0;
+  display:flex;align-items:center;gap:9px;
+  padding:22px 13px 11px;
+  background:linear-gradient(transparent,rgba(10,13,19,.86));
+}
+.who{font-size:13.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.muted-mark{color:var(--drop);flex:0 0 auto;display:none}
+.tile.muted .muted-mark{display:block}
+
+/* signature: per-peer signal readout */
+.readout{
+  margin-left:auto;flex:0 0 auto;
+  font-family:var(--mono);font-size:9.5px;font-weight:500;
+  letter-spacing:.13em;text-transform:uppercase;
+  color:var(--muted);
+  display:flex;align-items:center;gap:6px;
+}
+.readout .pip{width:5px;height:5px;border-radius:50%;background:var(--muted)}
+.readout[data-path=direct] .pip{background:var(--live)}
+.readout[data-path=relay] .pip{background:var(--signal)}
+.readout[data-path=failed]{color:var(--drop)}
+.readout[data-path=failed] .pip{background:var(--drop)}
+
+.controls{
+  flex:0 0 auto;
+  display:flex;align-items:center;justify-content:center;gap:9px;
+  padding:14px 16px calc(14px + env(safe-area-inset-bottom));
+  border-top:1px solid var(--line);
+}
+.ctl{
+  width:50px;height:50px;border-radius:14px;
+  background:var(--panel-2);border:1px solid var(--line);
+  display:flex;align-items:center;justify-content:center;
+}
+.ctl svg{width:21px;height:21px}
+.ctl:hover{border-color:#3b485c}
+.ctl.off{background:rgba(255,107,91,.13);border-color:rgba(255,107,91,.4);color:var(--drop)}
+.ctl.active{background:rgba(245,165,36,.14);border-color:rgba(245,165,36,.45);color:var(--signal)}
+.ctl.leave{width:auto;padding:0 22px;background:var(--drop);border-color:var(--drop);color:#12161d}
+.ctl.leave span{font-family:var(--display);font-weight:700;font-size:14.5px}
+@media (max-width:520px){.ctl{width:46px;height:46px}}
+
+.toast{
+  position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(8px);
+  background:var(--panel-2);border:1px solid var(--line);
+  padding:9px 16px;border-radius:10px;
+  font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+  opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+
+<!-- ============================ preflight ============================ -->
+<section id="preflight">
+  <div class="stage">
+    <div class="preview-frame off" id="previewFrame">
+      <video id="preview" autoplay playsinline muted></video>
+      <div class="preview-empty">camera off</div>
+      <div class="levels" id="levels"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="wordmark"><span class="dot"></span>OpenCall</div>
+    <p class="tagline">A private line for you and a few friends. Media goes straight between browsers, never through a server.</p>
+
+    <div class="field">
+      <label class="label" for="name">Your name</label>
+      <input type="text" id="name" placeholder="Who's calling?" maxlength="24" autocomplete="off">
+    </div>
+
+    <div class="field">
+      <label class="label" for="room">Channel</label>
+      <div class="callsign">
+        <input type="text" id="room" maxlength="12" autocomplete="off" spellcheck="false">
+        <button class="reroll" id="reroll" title="New channel">&#8635;</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label class="label" for="camSel">Camera</label>
+      <select id="camSel"><option>Default</option></select>
+    </div>
+
+    <div class="field">
+      <label class="label" for="micSel">Microphone</label>
+      <select id="micSel"><option>Default</option></select>
+    </div>
+
+    <div class="toggles">
+      <button class="toggle on" id="preMic">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/></svg>
+        Mic on
+      </button>
+      <button class="toggle off" id="preCam">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        Camera off
+      </button>
+    </div>
+
+    <button class="enter" id="enter">Join channel</button>
+    <div id="preErr"></div>
+
+    <p class="note">
+      Up to <b>6 people</b>. Everyone connects to everyone directly, so the
+      server only carries text. Works over the open internet — share the link
+      and they're in.
+    </p>
+  </div>
+</section>
+
+<!-- ============================== call =============================== -->
+<section id="call">
+  <header class="topbar">
+    <span class="channel" id="channelLabel">—</span>
+    <button class="copy" id="copyLink">Copy link</button>
+    <span class="count" id="count">1 on the line</span>
+  </header>
+
+  <div class="grid" id="grid" data-n="1"></div>
+
+  <div class="controls">
+    <button class="ctl" id="btnMic" title="Microphone">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/></svg>
+    </button>
+    <button class="ctl" id="btnCam" title="Camera">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+    </button>
+    <button class="ctl" id="btnShare" title="Share screen">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+    </button>
+    <button class="ctl leave" id="btnLeave"><span>Leave</span></button>
+  </div>
+</section>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+/* ==================================================================
+   ICE servers.
+
+   STUN is free and helps browsers discover their public address.
+   TURN relays media when a direct path is impossible (strict NAT,
+   some corporate wifi, some mobile carriers). Roughly 1 in 10
+   connections needs it.
+
+   Start without TURN. If a friend shows RELAY-less "CONNECTING" that
+   never resolves, run coturn on a cheap VPS and paste it below.
+   ================================================================== */
+const ICE_SERVERS = [
+  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+  // {
+  //   urls: ["turn:your-server.example:3478?transport=udp"],
+  //   username: "user",
+  //   credential: "pass"
+  // },
+];
+
+// ------------------------------------------------------------- state
+
+const state = {
+  ws: null,
+  selfId: null,
+  room: null,
+  name: "Guest",
+  localStream: null,
+  camStream: null,      // kept aside while screen sharing
+  screenStream: null,
+  micOn: true,
+  camOn: false,
+  sharing: false,
+  peers: new Map(),     // id -> { pc, name, tile, pending[], polite }
+  audioCtx: null,
+};
+
+const $ = (id) => document.getElementById(id);
+
+// ------------------------------------------------------- callsign gen
+
+const LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I/O, they read as 1/0
+const DIGITS = "23456789";
+function makeCallsign() {
+  const pick = (s) => s[Math.floor(Math.random() * s.length)];
+  return (
+    pick(LETTERS) + pick(LETTERS) + pick(LETTERS) + "-" +
+    pick(DIGITS) + pick(DIGITS) + pick(LETTERS)
+  );
+}
+
+// --------------------------------------------------------- preflight
+
+const previewFrame = $("previewFrame");
+const preview = $("preview");
+
+// Build the mic level meter bars.
+const LEVEL_BARS = 9;
+for (let i = 0; i < LEVEL_BARS; i++) $("levels").appendChild(document.createElement("i"));
+
+function showError(msg) {
+  $("preErr").innerHTML = `<div class="err">${msg}</div>`;
+}
+
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+// Room from the URL path, e.g. /KLM-2F9
+const pathRoom = location.pathname.replace(/^\//, "").toUpperCase();
+$("room").value = /^[A-Z0-9-]{3,12}$/.test(pathRoom) ? pathRoom : makeCallsign();
+$("name").value = localStorage.getItem("opencall.name") || "";
+
+$("reroll").onclick = () => { $("room").value = makeCallsign(); };
+
+async function startPreview() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: true,
+    });
+    state.localStream = stream;
+    state.camStream = stream;
+    preview.srcObject = stream;
+
+    // Default to camera off, mic on. Less startling for everyone.
+    stream.getVideoTracks().forEach((t) => (t.enabled = false));
+    state.camOn = false;
+    state.micOn = true;
+    paintPreToggles();
+
+    await listDevices();
+    meterMic(stream);
+  } catch (err) {
+    console.error(err);
+    if (err.name === "NotAllowedError") {
+      showError("Camera and mic access was blocked. Allow it in your browser's site settings, then reload.");
+    } else if (err.name === "NotFoundError") {
+      showError("No camera or microphone found. Plug one in and reload.");
+    } else if (!window.isSecureContext) {
+      showError("Browsers only allow camera access over HTTPS or on localhost.");
+    } else {
+      showError("Couldn't open your camera or mic: " + err.message);
+    }
+  }
+}
+
+async function listDevices() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const fill = (sel, kind) => {
+    const el = $(sel);
+    el.innerHTML = "";
+    devices
+      .filter((d) => d.kind === kind)
+      .forEach((d, i) => {
+        const o = document.createElement("option");
+        o.value = d.deviceId;
+        o.textContent = d.label || `${kind} ${i + 1}`;
+        el.appendChild(o);
+      });
+    if (!el.children.length) el.innerHTML = "<option>None found</option>";
+  };
+  fill("camSel", "videoinput");
+  fill("micSel", "audioinput");
+}
+
+async function swapDevice(kind, deviceId) {
+  const constraints =
+    kind === "video"
+      ? { video: { deviceId: { exact: deviceId } } }
+      : { audio: { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
+
+  const fresh = await navigator.mediaDevices.getUserMedia(constraints);
+  const newTrack = fresh.getTracks()[0];
+  const oldTrack = state.localStream.getTracks().find((t) => t.kind === kind);
+
+  if (oldTrack) {
+    newTrack.enabled = oldTrack.enabled;
+    state.localStream.removeTrack(oldTrack);
+    oldTrack.stop();
+  }
+  state.localStream.addTrack(newTrack);
+
+  // Push the new track to everyone already connected.
+  for (const peer of state.peers.values()) {
+    const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === kind);
+    if (sender) sender.replaceTrack(newTrack);
+  }
+  if (kind === "audio") meterMic(state.localStream);
+}
+
+$("camSel").onchange = (e) => swapDevice("video", e.target.value).catch(console.error);
+$("micSel").onchange = (e) => swapDevice("audio", e.target.value).catch(console.error);
+
+function paintPreToggles() {
+  const m = $("preMic"), c = $("preCam");
+  m.className = "toggle " + (state.micOn ? "on" : "off");
+  m.lastChild.textContent = state.micOn ? " Mic on" : " Mic off";
+  c.className = "toggle " + (state.camOn ? "on" : "off");
+  c.lastChild.textContent = state.camOn ? " Camera on" : " Camera off";
+  previewFrame.classList.toggle("off", !state.camOn);
+}
+
+$("preMic").onclick = () => {
+  state.micOn = !state.micOn;
+  state.localStream?.getAudioTracks().forEach((t) => (t.enabled = state.micOn));
+  paintPreToggles();
+};
+$("preCam").onclick = () => {
+  state.camOn = !state.camOn;
+  state.localStream?.getVideoTracks().forEach((t) => (t.enabled = state.camOn));
+  paintPreToggles();
+};
+
+// Mic level meter, also reused for the on-air rings in the call.
+function meterMic(stream) {
+  state.audioCtx = state.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  const src = state.audioCtx.createMediaStreamSource(stream);
+  const analyser = state.audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  src.connect(analyser);
+  const buf = new Uint8Array(analyser.frequencyBinCount);
+  const bars = $("levels").children;
+
+  (function loop() {
+    analyser.getByteFrequencyData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i];
+    const level = state.micOn ? Math.min(1, sum / buf.length / 60) : 0;
+    for (let i = 0; i < bars.length; i++) {
+      const lit = level * bars.length > i;
+      bars[i].style.height = (lit ? 5 + i * 2 : 4) + "px";
+      bars[i].classList.toggle("on", lit);
+    }
+    const selfTile = document.querySelector(".tile.self");
+    if (selfTile) selfTile.style.setProperty("--level", (level * 0.9).toFixed(2));
+    requestAnimationFrame(loop);
+  })();
+}
+
+startPreview();
+
+// ------------------------------------------------------------ joining
+
+$("enter").onclick = () => {
+  const name = $("name").value.trim() || "Guest";
+  const room = $("room").value.trim().toUpperCase();
+  if (!room) return showError("Pick a channel name first.");
+  localStorage.setItem("opencall.name", name);
+  state.name = name;
+  state.room = room;
+  connect();
+};
+
+$("name").addEventListener("keydown", (e) => { if (e.key === "Enter") $("enter").click(); });
+$("room").addEventListener("keydown", (e) => { if (e.key === "Enter") $("enter").click(); });
+
+function connect() {
+  $("enter").disabled = true;
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}`);
+  state.ws = ws;
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: "join", room: state.room, name: state.name }));
+    setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ type: "ping" })), 25000);
+  };
+
+  ws.onmessage = (ev) => handleSignal(JSON.parse(ev.data));
+
+  ws.onclose = () => {
+    if ($("call").classList.contains("live")) toast("Disconnected — reload to rejoin");
+    $("enter").disabled = false;
+  };
+
+  ws.onerror = () => {
+    showError("Couldn't reach the signaling server. Is it running?");
+    $("enter").disabled = false;
+  };
+}
+
+function handleSignal(msg) {
+  switch (msg.type) {
+    case "joined":
+      state.selfId = msg.id;
+      enterCall();
+      // We arrived last, so we send the offers. One initiator, no glare.
+      msg.peers.forEach((p) => {
+        const peer = createPeer(p.id, p.name);
+        makeOffer(p.id, peer);
+      });
+      break;
+
+    case "peer-joined":
+      // They will call us. Just make the slot and wait.
+      createPeer(msg.id, msg.name);
+      updateCount();
+      break;
+
+    case "peer-left":
+      dropPeer(msg.id);
+      break;
+
+    case "signal":
+      onPeerSignal(msg.from, msg.data);
+      break;
+
+    case "state": {
+      const peer = state.peers.get(msg.from);
+      if (peer) {
+        peer.tile.classList.toggle("muted", !msg.state.mic);
+        peer.tile.classList.toggle("novideo", !msg.state.cam && !msg.state.sharing);
+        peer.tile.classList.toggle("screen", !!msg.state.sharing);
+      }
+      break;
+    }
+
+    case "room-full":
+      showError(`That channel already has ${msg.limit} people. Mesh calling gets rough past that — start another channel.`);
+      $("enter").disabled = false;
+      break;
+  }
+}
+
+function enterCall() {
+  $("preflight").style.display = "none";
+  $("call").classList.add("live");
+  $("channelLabel").textContent = state.room;
+  history.replaceState(null, "", "/" + state.room);
+  addTile("self", state.name + " (you)", state.localStream, true);
+  paintControls();
+  updateCount();
+}
+
+// -------------------------------------------------------- peer wiring
+
+function createPeer(id, name) {
+  if (state.peers.has(id)) return state.peers.get(id);
+
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, bundlePolicy: "max-bundle" });
+  const tile = addTile(id, name || "Guest", null, false);
+  const peer = { pc, name, tile, pending: [], haveRemote: false };
+  state.peers.set(id, peer);
+
+  // Send our tracks.
+  state.localStream?.getTracks().forEach((track) => {
+    pc.addTrack(track, state.localStream);
+  });
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) sendTo(id, { candidate: e.candidate });
+  };
+
+  pc.ontrack = (e) => {
+    const video = tile.querySelector("video");
+    if (video.srcObject !== e.streams[0]) {
+      video.srcObject = e.streams[0];
+      attachRing(tile, e.streams[0]);
+    }
+    tile.classList.remove("novideo");
+  };
+
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    if (s === "failed") {
+      setReadout(tile, "failed", "no route");
+      // A failed ICE run usually means both sides are behind strict NAT
+      // and there is no TURN server configured.
+    } else if (s === "disconnected") {
+      setReadout(tile, "", "unstable");
+    }
+  };
+
+  pollStats(id, peer);
+  updateCount();
+  return peer;
+}
+
+async function makeOffer(id, peer) {
+  const offer = await peer.pc.createOffer();
+  await peer.pc.setLocalDescription(offer);
+  sendTo(id, { sdp: peer.pc.localDescription });
+}
+
+async function onPeerSignal(from, data) {
+  let peer = state.peers.get(from) || createPeer(from, "Guest");
+  const pc = peer.pc;
+
+  try {
+    if (data.sdp) {
+      await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      peer.haveRemote = true;
+
+      // Flush candidates that arrived before the description.
+      for (const c of peer.pending) {
+        await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
+      }
+      peer.pending = [];
+
+      if (data.sdp.type === "offer") {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        sendTo(from, { sdp: pc.localDescription });
+      }
+    } else if (data.candidate) {
+      if (peer.haveRemote) {
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(console.warn);
+      } else {
+        peer.pending.push(data.candidate);
+      }
+    }
+  } catch (err) {
+    console.error("signal error", err);
+  }
+}
+
+function sendTo(id, data) {
+  state.ws?.send(JSON.stringify({ type: "signal", to: id, data }));
+}
+
+function broadcastState() {
+  state.ws?.send(JSON.stringify({
+    type: "state",
+    state: { mic: state.micOn, cam: state.camOn, sharing: state.sharing },
+  }));
+}
+
+function dropPeer(id) {
+  const peer = state.peers.get(id);
+  if (!peer) return;
+  clearInterval(peer.statsTimer);
+  peer.pc.close();
+  peer.tile.remove();
+  state.peers.delete(id);
+  reflowGrid();
+  updateCount();
+}
+
+/* Signal readout: is this connection direct, or relayed through TURN?
+   This is the single most useful number when something goes wrong. */
+function pollStats(id, peer) {
+  peer.statsTimer = setInterval(async () => {
+    if (peer.pc.connectionState !== "connected") return;
+    try {
+      const stats = await peer.pc.getStats();
+      let pair = null;
+      const byId = new Map();
+      stats.forEach((r) => byId.set(r.id, r));
+      stats.forEach((r) => {
+        if (r.type === "candidate-pair" && r.state === "succeeded" && r.nominated) pair = r;
+      });
+      if (!pair) return;
+
+      const local = byId.get(pair.localCandidateId);
+      const remote = byId.get(pair.remoteCandidateId);
+      const relayed =
+        local?.candidateType === "relay" || remote?.candidateType === "relay";
+      const rtt = pair.currentRoundTripTime
+        ? Math.round(pair.currentRoundTripTime * 1000) + "ms"
+        : "—";
+      setReadout(peer.tile, relayed ? "relay" : "direct", `${relayed ? "relay" : "direct"} ${rtt}`);
+    } catch { /* getStats can throw during teardown */ }
+  }, 2500);
+}
+
+function setReadout(tile, path, text) {
+  const r = tile.querySelector(".readout");
+  r.dataset.path = path;
+  r.lastChild.textContent = text;
+}
+
+// ---------------------------------------------------------- the grid
+
+function addTile(id, name, stream, isSelf) {
+  const tile = document.createElement("div");
+  tile.className = "tile" + (isSelf ? " self" : "") + " novideo";
+  tile.dataset.peer = id;
+  tile.innerHTML = `
+    <video autoplay playsinline ${isSelf ? "muted" : ""}></video>
+    <div class="avatar">${(name[0] || "?").toUpperCase()}</div>
+    <div class="tile-foot">
+      <svg class="muted-mark" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 2l20 20"/><path d="M9 9v3a3 3 0 0 0 5 2"/><path d="M15 10V5a3 3 0 0 0-6-.6"/><path d="M19 10v2a7 7 0 0 1-1 3.6"/><path d="M12 19v3"/></svg>
+      <span class="who">${escapeHtml(name)}</span>
+      <span class="readout" data-path=""><span class="pip"></span><span>connecting</span></span>
+    </div>`;
+  if (stream) {
+    tile.querySelector("video").srcObject = stream;
+    if (isSelf && state.camOn) tile.classList.remove("novideo");
+  }
+  $("grid").appendChild(tile);
+  reflowGrid();
+  return tile;
+}
+
+function reflowGrid() {
+  $("grid").dataset.n = $("grid").children.length;
+}
+
+function updateCount() {
+  const n = state.peers.size + 1;
+  $("count").textContent = n === 1 ? "just you so far" : `${n} on the line`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Amber ring around whoever is talking.
+function attachRing(tile, stream) {
+  if (!stream.getAudioTracks().length) return;
+  state.audioCtx = state.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  const src = state.audioCtx.createMediaStreamSource(stream);
+  const analyser = state.audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  src.connect(analyser);
+  const buf = new Uint8Array(analyser.frequencyBinCount);
+
+  (function loop() {
+    if (!tile.isConnected) return;
+    analyser.getByteFrequencyData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i];
+    const level = Math.min(1, sum / buf.length / 55);
+    tile.style.setProperty("--level", (level * 0.9).toFixed(2));
+    requestAnimationFrame(loop);
+  })();
+}
+
+// -------------------------------------------------------- call controls
+
+function paintControls() {
+  $("btnMic").classList.toggle("off", !state.micOn);
+  $("btnCam").classList.toggle("off", !state.camOn);
+  $("btnShare").classList.toggle("active", state.sharing);
+  const selfTile = document.querySelector(".tile.self");
+  if (selfTile) {
+    selfTile.classList.toggle("muted", !state.micOn);
+    selfTile.classList.toggle("novideo", !state.camOn && !state.sharing);
+    selfTile.classList.toggle("screen", state.sharing);
+    setReadout(selfTile, "direct", "you");
+  }
+}
+
+$("btnMic").onclick = () => {
+  state.micOn = !state.micOn;
+  state.localStream.getAudioTracks().forEach((t) => (t.enabled = state.micOn));
+  paintControls();
+  broadcastState();
+};
+
+$("btnCam").onclick = () => {
+  if (state.sharing) return toast("Stop sharing first");
+  state.camOn = !state.camOn;
+  state.localStream.getVideoTracks().forEach((t) => (t.enabled = state.camOn));
+  paintControls();
+  broadcastState();
+};
+
+$("btnShare").onclick = async () => {
+  if (state.sharing) return stopSharing();
+  try {
+    const screen = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 15 },
+      audio: false,
+    });
+    state.screenStream = screen;
+    state.sharing = true;
+    const track = screen.getVideoTracks()[0];
+
+    // Swap the outgoing video track on every open connection.
+    for (const peer of state.peers.values()) {
+      const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === "video");
+      if (sender) await sender.replaceTrack(track);
+    }
+    document.querySelector(".tile.self video").srcObject = screen;
+    track.onended = stopSharing; // the browser's own "Stop sharing" bar
+    paintControls();
+    broadcastState();
+  } catch (err) {
+    if (err.name !== "NotAllowedError") toast("Screen share unavailable");
+  }
+};
+
+async function stopSharing() {
+  if (!state.sharing) return;
+  state.screenStream?.getTracks().forEach((t) => t.stop());
+  state.screenStream = null;
+  state.sharing = false;
+
+  const camTrack = state.localStream.getVideoTracks()[0];
+  for (const peer of state.peers.values()) {
+    const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === "video");
+    if (sender && camTrack) await sender.replaceTrack(camTrack);
+  }
+  document.querySelector(".tile.self video").srcObject = state.localStream;
+  paintControls();
+  broadcastState();
+}
+
+$("copyLink").onclick = async () => {
+  const url = location.origin + "/" + state.room;
+  try {
+    await navigator.clipboard.writeText(url);
+    toast("Link copied");
+  } catch {
+    prompt("Copy this link:", url);
+  }
+};
+
+$("btnLeave").onclick = () => {
+  state.ws?.close();
+  state.peers.forEach((p) => p.pc.close());
+  state.localStream?.getTracks().forEach((t) => t.stop());
+  state.screenStream?.getTracks().forEach((t) => t.stop());
+  location.href = "/";
+};
+
+window.addEventListener("beforeunload", () => state.ws?.close());
+</script>
+</body>
+</html>
