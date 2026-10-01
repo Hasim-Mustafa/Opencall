@@ -81,6 +81,19 @@ jobs:
           print(xml)
           PY
 
+      # Some dependencies pull in kotlin-stdlib-jdk8 1.6.x alongside
+      # kotlin-stdlib 1.8.x, which fails with "Duplicate class" errors.
+      # The Kotlin BOM aligns every kotlin-stdlib artifact to one version.
+      - name: Align Kotlin versions
+        run: |
+          cat >> android/app/build.gradle <<'GRADLE'
+
+          dependencies {
+              implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
+          }
+          GRADLE
+          tail -n 6 android/app/build.gradle
+
       - name: Build the APK
         run: |
           cd android
