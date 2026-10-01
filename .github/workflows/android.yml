@@ -1,0 +1,101 @@
+name: Build Android APK
+
+# Run it by hand from the Actions tab, or automatically when the Android
+# config changes. Normal web edits don't need a rebuild — the app loads the
+# live site, so changes to index.html reach installed phones immediately.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'capacitor.config.json'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      # Capacitor is only needed to build the wrapper, so it is not added to
+      # package.json. Keeping it out means Render's deploy stays fast.
+      - name: Install Capacitor
+        run: |
+          npm install
+          npm install --no-save \
+            @capacitor/core @capacitor/cli @capacitor/android
+
+      - name: Generate the Android project
+        run: npx cap add android
+
+      # Launcher icon and splash, built from the PNGs already in the repo.
+      - name: Apply app icon and splash
+        run: |
+          mkdir -p assets
+          cp public/icons/icon-1024.png assets/icon.png
+          cp public/icons/splash-2732.png assets/splash.png
+          cp public/icons/splash-2732.png assets/splash-dark.png
+          npx @capacitor/assets generate --android
+
+      # Capacitor's generated manifest has no camera or mic permission.
+      # Without these, getUserMedia fails silently inside the app.
+      - name: Add camera and microphone permissions
+        run: |
+          python3 - <<'PY'
+          import re, pathlib
+
+          p = pathlib.Path('android/app/src/main/AndroidManifest.xml')
+          xml = p.read_text()
+
+          perms = """
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+          """
+
+          if 'android.permission.CAMERA' not in xml:
+              xml = xml.replace('</manifest>', perms + '\n</manifest>')
+              p.write_text(xml)
+              print('permissions added')
+          else:
+              print('permissions already present')
+
+          print(xml)
+          PY
+
+      - name: Build the APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Rename it
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/debug/app-debug.apk out/GMST.apk
+          ls -lh out/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: GMST-APK
+          path: out/GMST.apk
+          retention-days: 90
