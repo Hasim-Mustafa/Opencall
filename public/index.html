@@ -3,7 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>OpenCall</title>
+<title>GMST</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#10141c">
+<meta name="description" content="A private line for you and a few friends.">
+<link rel="icon" href="/icons/favicon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="GMST">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -169,6 +178,22 @@ select{cursor:pointer}
 .enter:hover{filter:brightness(1.08)}
 .enter:disabled{opacity:.45;cursor:not-allowed}
 
+/* install prompt — hidden until the browser says it's installable */
+.install{
+  display:none;align-items:center;gap:11px;
+  margin-top:18px;padding:12px 14px;
+  border:1px solid var(--line);border-radius:11px;
+  background:var(--panel-2);width:100%;text-align:left;
+}
+.install.ready{display:flex}
+.install svg{width:18px;height:18px;color:var(--signal);flex:0 0 auto}
+.install b{display:block;font-size:13.5px;font-weight:500}
+.install span{
+  display:block;font-family:var(--mono);font-size:10.5px;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-top:2px;
+}
+.install:hover{border-color:var(--signal)}
+
 .note{
   margin-top:auto;padding-top:26px;
   font-family:var(--mono);font-size:11px;line-height:1.75;
@@ -315,7 +340,7 @@ select{cursor:pointer}
   </div>
 
   <div class="panel">
-    <div class="wordmark"><span class="dot"></span>OpenCall</div>
+    <div class="wordmark"><span class="dot"></span>GMST</div>
     <p class="tagline">A private line for you and a few friends. Media goes straight between browsers, never through a server.</p>
 
     <div class="field">
@@ -354,6 +379,14 @@ select{cursor:pointer}
 
     <button class="enter" id="enter">Join channel</button>
     <div id="preErr"></div>
+
+    <button class="install" id="install">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M4 20h16"/></svg>
+      <span style="text-transform:none;letter-spacing:0;color:inherit;margin:0">
+        <b>Install GMST</b>
+        <span>Own window, own icon</span>
+      </span>
+    </button>
 
     <p class="note">
       Up to <b>6 people</b>. Everyone connects to everyone directly, so the
@@ -974,6 +1007,61 @@ $("btnLeave").onclick = () => {
 };
 
 window.addEventListener("beforeunload", () => state.ws?.close());
+
+/* ------------------------------------------------------------ install
+
+   Chrome, Edge and Android fire beforeinstallprompt when the app meets
+   the install criteria (manifest, service worker, HTTPS). We stash the
+   event and fire it when the button is clicked.
+
+   Safari and iOS never fire it — they use Share > Add to Home Screen
+   instead, so we show a hint there rather than a button.
+   -------------------------------------------------------------------- */
+
+let deferredInstall = null;
+const installBtn = $("install");
+
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  deferredInstall = e;
+  installBtn.classList.add("ready");
+});
+
+installBtn.onclick = async () => {
+  if (!deferredInstall) return;
+  deferredInstall.prompt();
+  const { outcome } = await deferredInstall.userChoice;
+  deferredInstall = null;
+  installBtn.classList.remove("ready");
+  if (outcome === "accepted") toast("Installed");
+};
+
+window.addEventListener("appinstalled", () => {
+  deferredInstall = null;
+  installBtn.classList.remove("ready");
+});
+
+// Already running as an installed app? Nothing to offer.
+const standalone =
+  window.matchMedia("(display-mode: standalone)").matches ||
+  window.navigator.standalone === true;
+
+// iOS: no install event exists, so point at the Share menu instead.
+const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+if (isIOS && !standalone) {
+  installBtn.classList.add("ready");
+  installBtn.querySelector("b").textContent = "Add to Home Screen";
+  installBtn.querySelector("span span").textContent = "Share button, then Add to Home Screen";
+  installBtn.onclick = () => toast("Tap Share, then Add to Home Screen");
+}
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch((err) => {
+      console.warn("Service worker registration failed:", err);
+    });
+  });
+}
 </script>
 </body>
 </html>
