@@ -1,0 +1,22 @@
+{
+  "appId": "com.hasim.opencall",
+  "appName": "GMST",
+  "webDir": "public",
+  "server": {
+    "url": "https://opencall-gv6w.onrender.com",
+    "cleartext": false,
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "webContentsDebuggingEnabled": false
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 800,
+      "backgroundColor": "#10141c",
+      "androidScaleType": "CENTER_CROP",
+      "showSpinner": false
+    }
+  }
+}
