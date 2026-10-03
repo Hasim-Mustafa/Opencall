@@ -313,6 +313,30 @@ select{cursor:pointer}
 .ctl.leave span{font-family:var(--display);font-weight:700;font-size:14.5px}
 @media (max-width:520px){.ctl{width:46px;height:46px}}
 
+.sheet-back{
+  position:fixed;inset:0;z-index:20;
+  background:rgba(8,10,15,.6);
+  display:flex;align-items:flex-end;justify-content:center;
+}
+.sheet-back[hidden]{display:none}
+.sheet{
+  width:100%;max-width:440px;
+  background:var(--panel);border:1px solid var(--line);
+  border-radius:16px 16px 0 0;
+  padding:20px 22px calc(24px + env(safe-area-inset-bottom));
+}
+@media (min-width:700px){
+  .sheet-back{align-items:center}
+  .sheet{border-radius:16px}
+}
+.sheet-head{display:flex;align-items:center;justify-content:space-between}
+.sheet-head b{font-family:var(--display);font-size:18px;font-weight:700}
+.sheet-x{font-size:24px;line-height:1;color:var(--muted);padding:2px 8px}
+.sheet .field:first-of-type{margin-top:14px}
+.sheet .field{margin-top:16px}
+.sheet-note{margin-top:16px;font-size:12.5px;color:var(--muted);line-height:1.55}
+.sheet-note:empty{display:none}
+
 .toast{
   position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(8px);
   background:var(--panel-2);border:1px solid var(--line);
@@ -366,6 +390,11 @@ select{cursor:pointer}
       <select id="micSel"><option>Default</option></select>
     </div>
 
+    <div class="field spk-field" hidden>
+      <label class="label" for="spkSel">Speaker</label>
+      <select id="spkSel"><option>Default</option></select>
+    </div>
+
     <div class="toggles">
       <button class="toggle on" id="preMic">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/></svg>
@@ -416,11 +445,36 @@ select{cursor:pointer}
     <button class="ctl" id="btnShare" title="Share screen">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
     </button>
+    <button class="ctl" id="btnDevices" title="Audio and video settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
+    </button>
     <button class="ctl leave" id="btnLeave"><span>Leave</span></button>
   </div>
 </section>
 
 <div class="toast" id="toast"></div>
+
+<div class="sheet-back" id="sheetBack" hidden>
+  <div class="sheet" role="dialog" aria-label="Audio and video settings">
+    <div class="sheet-head">
+      <b>Devices</b>
+      <button class="sheet-x" id="sheetClose" aria-label="Close">&times;</button>
+    </div>
+    <div class="field">
+      <label class="label" for="callMic">Microphone</label>
+      <select id="callMic"></select>
+    </div>
+    <div class="field spk-field" hidden>
+      <label class="label" for="callSpk">Speaker</label>
+      <select id="callSpk"></select>
+    </div>
+    <div class="field">
+      <label class="label" for="callCam">Camera</label>
+      <select id="callCam"></select>
+    </div>
+    <p class="sheet-note" id="sheetNote"></p>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -508,11 +562,12 @@ async function startPreview() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      video: true,
+      video: IS_MOBILE ? { facingMode: { ideal: "user" } } : true,
     });
     state.localStream = stream;
     state.camStream = stream;
     preview.srcObject = stream;
+    stream.getTracks().forEach(watchTrack);
 
     // Default to camera off, mic on. Less startling for everyone.
     stream.getVideoTracks().forEach((t) => (t.enabled = false));
@@ -536,52 +591,223 @@ async function startPreview() {
   }
 }
 
+/* ------------------------------------------------------------ devices
+
+   Default behaviour: use whatever the operating system is using, and keep
+   following it. Plug in headphones mid-call and audio moves to them, the
+   same as any native call app. Picking a specific device pins it until
+   that device disappears, then it falls back to the system default.
+
+   Browsers list a lot of noise: "Default" and "Communications" entries
+   that duplicate real devices, and on phones every camera lens and audio
+   route separately. This collapses all of that into a short list.
+   -------------------------------------------------------------------- */
+
+const IS_MOBILE =
+  /android|iphone|ipad|ipod/i.test(navigator.userAgent) ||
+  window.matchMedia("(pointer:coarse)").matches;
+
+// Speaker selection only works where the browser can route output.
+// Android and iOS route audio themselves (earpiece, speaker, Bluetooth).
+const CAN_PICK_SPEAKER =
+  !IS_MOBILE && typeof HTMLMediaElement !== "undefined" &&
+  "setSinkId" in HTMLMediaElement.prototype;
+
+state.pref = { audio: "default", video: IS_MOBILE ? "facing:user" : "default", output: "default" };
+
+const SELECTS = {
+  audioinput: ["micSel", "callMic"],
+  videoinput: ["camSel", "callCam"],
+  audiooutput: ["spkSel", "callSpk"],
+};
+
+function cleanList(devices, kind) {
+  const list = devices.filter((d) => d.kind === kind && d.deviceId !== "communications");
+  const def = list.find((d) => d.deviceId === "default");
+  const seen = new Set();
+  const out = [];
+
+  // The system default always comes first, named after the real device.
+  if (kind !== "videoinput") {
+    const real = def && def.label.replace(/^Default\s*-\s*/i, "");
+    out.push({ id: "default", label: real ? `System default (${real})` : "System default" });
+    if (def) seen.add(def.groupId + "|" + real);
+  }
+
+  list.forEach((d, i) => {
+    if (d.deviceId === "default") return;
+    const label = d.label || `${kind === "videoinput" ? "Camera" : "Device"} ${i + 1}`;
+    const key = d.groupId + "|" + label;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ id: d.deviceId, label });
+  });
+  return out;
+}
+
 async function listDevices() {
   const devices = await navigator.mediaDevices.enumerateDevices();
-  const fill = (sel, kind) => {
-    const el = $(sel);
-    el.innerHTML = "";
-    devices
-      .filter((d) => d.kind === kind)
-      .forEach((d, i) => {
-        const o = document.createElement("option");
-        o.value = d.deviceId;
-        o.textContent = d.label || `${kind} ${i + 1}`;
-        el.appendChild(o);
+
+  const fill = (kind, options, selected) => {
+    for (const id of SELECTS[kind]) {
+      const el = $(id);
+      if (!el) continue;
+      el.innerHTML = "";
+      options.forEach((o) => {
+        const opt = document.createElement("option");
+        opt.value = o.id;
+        opt.textContent = o.label;
+        el.appendChild(opt);
       });
-    if (!el.children.length) el.innerHTML = "<option>None found</option>";
+      if (!options.length) el.innerHTML = "<option value=''>None found</option>";
+      el.value = options.some((o) => o.id === selected) ? selected : (options[0]?.id || "");
+    }
   };
-  fill("camSel", "videoinput");
-  fill("micSel", "audioinput");
+
+  // Phones report internal audio routes (speakerphone, earpiece) as
+  // separate mics. Only real external devices are worth offering.
+  let mics = cleanList(devices, "audioinput");
+  if (IS_MOBILE) mics = mics.filter((m) => m.id === "default" || /bluetooth|usb|wired|headset(?! earpiece)/i.test(m.label));
+  fill("audioinput", mics, state.pref.audio);
+
+  // Phones: front and back, not every lens the hardware reports.
+  if (IS_MOBILE) {
+    const cams = devices.filter((d) => d.kind === "videoinput");
+    const opts = [{ id: "facing:user", label: "Front camera" }];
+    if (cams.length > 1) opts.push({ id: "facing:environment", label: "Back camera" });
+    fill("videoinput", opts, state.pref.video);
+  } else {
+    const cams = cleanList(devices, "videoinput");
+    if (state.pref.video === "default") {
+      const live = state.camStream?.getVideoTracks()[0]?.getSettings().deviceId;
+      if (live) state.pref.video = live;
+    }
+    fill("videoinput", cams, state.pref.video);
+  }
+
+  document.querySelectorAll(".spk-field").forEach((f) => (f.hidden = !CAN_PICK_SPEAKER));
+  if (CAN_PICK_SPEAKER) fill("audiooutput", cleanList(devices, "audiooutput"), state.pref.output);
+
+  return devices;
 }
 
-async function swapDevice(kind, deviceId) {
-  const constraints =
-    kind === "video"
-      ? { video: { deviceId: { exact: deviceId } } }
-      : { audio: { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
+function constraintsFor(kind, choice) {
+  if (kind === "audio") {
+    const base = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+    return { audio: choice === "default" ? base : { ...base, deviceId: { exact: choice } } };
+  }
+  if (choice.startsWith("facing:")) {
+    return { video: { facingMode: { ideal: choice.slice(7) } } };
+  }
+  return { video: choice === "default" ? true : { deviceId: { exact: choice } } };
+}
 
-  const fresh = await navigator.mediaDevices.getUserMedia(constraints);
+async function swapDevice(kind, choice) {
+  state.pref[kind] = choice;
+
+  const fresh = await navigator.mediaDevices.getUserMedia(constraintsFor(kind, choice));
   const newTrack = fresh.getTracks()[0];
-  const oldTrack = state.localStream.getTracks().find((t) => t.kind === kind);
+  const stream = state.camStream || state.localStream;
+  const oldTrack = stream.getTracks().find((t) => t.kind === kind);
 
+  newTrack.enabled = kind === "audio" ? state.micOn : state.camOn;
   if (oldTrack) {
-    newTrack.enabled = oldTrack.enabled;
-    state.localStream.removeTrack(oldTrack);
+    stream.removeTrack(oldTrack);
     oldTrack.stop();
   }
-  state.localStream.addTrack(newTrack);
+  stream.addTrack(newTrack);
+  watchTrack(newTrack);
 
-  // Push the new track to everyone already connected.
-  for (const peer of state.peers.values()) {
-    const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === kind);
-    if (sender) sender.replaceTrack(newTrack);
+  // While screen sharing, the screen stays on the wire; the new camera
+  // takes over when sharing stops.
+  if (!(kind === "video" && state.sharing)) {
+    for (const peer of state.peers.values()) {
+      const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === kind);
+      if (sender) await sender.replaceTrack(newTrack);
+    }
   }
-  if (kind === "audio") meterMic(state.localStream);
+
+  if (kind === "audio") meterMic(stream);
+  await listDevices();
 }
 
-$("camSel").onchange = (e) => swapDevice("video", e.target.value).catch(console.error);
-$("micSel").onchange = (e) => swapDevice("audio", e.target.value).catch(console.error);
+async function setSpeaker(id) {
+  state.pref.output = id;
+  const targets = document.querySelectorAll(".tile:not(.self) video");
+  for (const v of targets) {
+    try { await v.setSinkId(id === "default" ? "" : id); } catch (e) { console.warn(e); }
+  }
+  await listDevices();
+}
+
+function applySinkTo(video) {
+  if (CAN_PICK_SPEAKER && state.pref.output !== "default") {
+    video.setSinkId(state.pref.output).catch(console.warn);
+  }
+}
+
+// A track ends when its device is unplugged. Fall back to the system default.
+function watchTrack(track) {
+  track.onended = () => {
+    const kind = track.kind;
+    if (state.pref[kind] && state.pref[kind] !== "default" && !state.pref[kind].startsWith("facing:")) {
+      toast(`${kind === "audio" ? "Microphone" : "Camera"} disconnected, switched to default`);
+    }
+    swapDevice(kind, kind === "video" && IS_MOBILE ? state.pref.video : "default").catch(console.error);
+  };
+}
+
+// Follow the system when devices come and go.
+let deviceTimer = null;
+navigator.mediaDevices.addEventListener?.("devicechange", () => {
+  clearTimeout(deviceTimer);
+  deviceTimer = setTimeout(async () => {
+    if (!state.localStream) return;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const exists = (id) => devices.some((d) => d.deviceId === id);
+
+    // Default mic: re-acquire so we land on whatever the OS now prefers.
+    if (state.pref.audio === "default") {
+      await swapDevice("audio", "default").catch(console.error);
+    } else if (!exists(state.pref.audio)) {
+      toast("Microphone disconnected, switched to default");
+      await swapDevice("audio", "default").catch(console.error);
+    }
+
+    if (CAN_PICK_SPEAKER && state.pref.output !== "default" && !exists(state.pref.output)) {
+      toast("Speaker disconnected, switched to default");
+      await setSpeaker("default");
+    }
+    await listDevices();
+  }, 400);
+});
+
+const onPick = (kind) => (e) => {
+  if (!e.target.value) return;
+  const run = kind === "output" ? setSpeaker(e.target.value) : swapDevice(kind, e.target.value);
+  run.catch((err) => {
+    console.error(err);
+    toast("Couldn't switch to that device");
+    listDevices();
+  });
+};
+
+$("micSel").onchange = onPick("audio");
+$("callMic").onchange = onPick("audio");
+$("camSel").onchange = onPick("video");
+$("callCam").onchange = onPick("video");
+$("spkSel").onchange = onPick("output");
+$("callSpk").onchange = onPick("output");
+
+$("btnDevices").onclick = async () => {
+  await listDevices();
+  $("sheetNote").textContent = IS_MOBILE
+    ? "Speaker, earpiece and Bluetooth are switched by your phone. Connect or disconnect headphones and the call follows."
+    : "";
+  $("sheetBack").hidden = false;
+};
+$("sheetClose").onclick = () => ($("sheetBack").hidden = true);
+$("sheetBack").onclick = (e) => { if (e.target.id === "sheetBack") $("sheetBack").hidden = true; };
 
 function paintPreToggles() {
   const m = $("preMic"), c = $("preCam");
@@ -605,6 +831,7 @@ $("preCam").onclick = () => {
 
 // Mic level meter, also reused for the on-air rings in the call.
 function meterMic(stream) {
+  const token = (state.meterToken = (state.meterToken || 0) + 1);
   state.audioCtx = state.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
   const src = state.audioCtx.createMediaStreamSource(stream);
   const analyser = state.audioCtx.createAnalyser();
@@ -625,7 +852,7 @@ function meterMic(stream) {
     }
     const selfTile = document.querySelector(".tile.self");
     if (selfTile) selfTile.style.setProperty("--level", (level * 0.9).toFixed(2));
-    requestAnimationFrame(loop);
+    if (token === state.meterToken) requestAnimationFrame(loop);
   })();
 }
 
@@ -653,19 +880,25 @@ function connect() {
   state.ws = ws;
 
   ws.onopen = () => {
+    state.retry = 0;
     ws.send(JSON.stringify({ type: "join", room: state.room, name: state.name }));
-    setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ type: "ping" })), 25000);
+    clearInterval(state.pingTimer);
+    state.pingTimer = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ type: "ping" })), 25000);
   };
 
   ws.onmessage = (ev) => handleSignal(JSON.parse(ev.data));
 
   ws.onclose = () => {
-    if ($("call").classList.contains("live")) toast("Disconnected — reload to rejoin");
+    if (state.ws !== ws) return;          // an older socket we already replaced
     $("enter").disabled = false;
+    if (!inCall() || state.leaving) return;
+    // Phone in the background: wait until the app is visible again.
+    if (document.hidden) { state.needsRejoin = true; return; }
+    scheduleRejoin();
   };
 
   ws.onerror = () => {
-    showError("Couldn't reach the signaling server. Is it running?");
+    if (!inCall()) showError("Couldn't reach the server. It may be waking up — try again in a moment.");
     $("enter").disabled = false;
   };
 }
@@ -718,10 +951,105 @@ function enterCall() {
   $("call").classList.add("live");
   $("channelLabel").textContent = state.room;
   history.replaceState(null, "", "/" + state.room);
-  addTile("self", state.name + " (you)", state.localStream, true);
+  if (!document.querySelector(".tile.self")) {
+    addTile("self", state.name + " (you)", state.localStream, true);
+  }
   paintControls();
   updateCount();
 }
+
+/* --------------------------------------------------------- lifecycle
+
+   Phones pause backgrounded apps: the camera is blocked by the OS, video
+   playback stops, and the server connection may drop. So when the app is
+   hidden we switch the camera off cleanly (friends see your avatar, not a
+   frozen frame), and when it comes back we restore the camera, restart
+   playback, and rejoin if any connection died along the way.
+   -------------------------------------------------------------------- */
+
+const inCall = () => $("call").classList.contains("live");
+
+function scheduleRejoin() {
+  clearTimeout(state.rejoinTimer);
+  const wait = Math.min(1000 * 2 ** (state.retry || 0), 15000);
+  state.retry = (state.retry || 0) + 1;
+  toast("Reconnecting…");
+  state.rejoinTimer = setTimeout(rejoin, wait);
+}
+
+// Rejoining as a newcomer reuses the normal join path: we send fresh offers
+// to everyone, so there's no renegotiation logic to get wrong.
+function rejoin() {
+  state.needsRejoin = false;
+  for (const id of [...state.peers.keys()]) dropPeer(id);
+  const old = state.ws;
+  state.ws = null;
+  try { old && old.readyState <= 1 && old.close(); } catch {}
+  connect();
+}
+
+function peersBroken() {
+  for (const peer of state.peers.values()) {
+    const s = peer.pc.connectionState;
+    if (s === "failed" || s === "closed") return true;
+  }
+  return false;
+}
+
+document.addEventListener("visibilitychange", async () => {
+  if (!inCall()) return;
+
+  if (document.hidden) {
+    if (!IS_MOBILE) return;               // desktop: switching windows is fine
+    state.camBeforeHide = state.camOn && !state.sharing;
+    if (state.camBeforeHide) {
+      state.localStream.getVideoTracks().forEach((t) => (t.enabled = false));
+      state.camOn = false;
+      paintControls();
+      broadcastState();
+    }
+    return;
+  }
+
+  // ---- back in the foreground
+  state.audioCtx?.state === "suspended" && state.audioCtx.resume();
+
+  if (state.camBeforeHide) {
+    state.camBeforeHide = false;
+    const track = state.localStream.getVideoTracks()[0];
+    try {
+      if (!track || track.readyState === "ended") {
+        state.camOn = true;               // swapDevice copies this onto the new track
+        await swapDevice("video", state.pref.video);
+      } else {
+        track.enabled = true;
+        state.camOn = true;
+      }
+    } catch (e) {
+      console.error(e);
+      state.camOn = false;
+      toast("Camera unavailable");
+    }
+    paintControls();
+    broadcastState();
+  }
+
+  document.querySelectorAll("video").forEach((v) => v.paused && v.play().catch(() => {}));
+
+  const wsDead = !state.ws || state.ws.readyState > 1;
+  if (state.needsRejoin || wsDead || peersBroken()) {
+    state.retry = 0;
+    rejoin();
+    return;
+  }
+
+  // A "disconnected" peer often recovers on its own; give it a moment.
+  setTimeout(() => {
+    for (const peer of state.peers.values()) {
+      if (peer.pc.connectionState === "disconnected") { rejoin(); break; }
+    }
+  }, 4000);
+});
 
 // -------------------------------------------------------- peer wiring
 
@@ -746,6 +1074,7 @@ function createPeer(id, name) {
     const video = tile.querySelector("video");
     if (video.srcObject !== e.streams[0]) {
       video.srcObject = e.streams[0];
+      applySinkTo(video);
       attachRing(tile, e.streams[0]);
     }
     tile.classList.remove("novideo");
@@ -999,6 +1328,7 @@ $("copyLink").onclick = async () => {
 };
 
 $("btnLeave").onclick = () => {
+  state.leaving = true;
   state.ws?.close();
   state.peers.forEach((p) => p.pc.close());
   state.localStream?.getTracks().forEach((t) => t.stop());
