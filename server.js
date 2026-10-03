@@ -23,6 +23,9 @@ const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
+  '.png': 'image/png',
+  '.webmanifest': 'application/manifest+json',
+  '.json': 'application/json',
 };
 
 // ---------------------------------------------------------------- HTTP
@@ -101,8 +104,25 @@ function leaveRoom(client) {
   client.roomId = null;
 }
 
+// Phones that go to the background can vanish without closing their
+// connection. Ping every socket; drop any that don't answer, so their
+// tile disappears for everyone instead of freezing.
+const HEARTBEAT_MS = 20000;
+setInterval(() => {
+  for (const socket of wss.clients) {
+    if (socket.isAlive === false) {
+      socket.terminate();
+      continue;
+    }
+    socket.isAlive = false;
+    socket.ping();
+  }
+}, HEARTBEAT_MS);
+
 wss.on('connection', (socket) => {
   const client = { socket, peerId: makeId(), roomId: null, name: 'Guest' };
+  socket.isAlive = true;
+  socket.on('pong', () => { socket.isAlive = true; });
 
   socket.on('message', (raw) => {
     let msg;
