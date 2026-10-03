@@ -17,6 +17,58 @@ const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_PER_ROOM = 6; // mesh topology degrades past this
 
+// Supabase holds accounts, friends and rooms. The publishable key is public
+// by design; the database's row-level security does the real protecting.
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://digxpaplfwupprgqlrrl.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_CskiJhY892G7-FGU2VgZ-Q_K6JmpNO0';
+const UUID_RE = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/;
+
+/**
+ * Is the holder of this login token a member of this room?
+ * Asks Supabase as that user: the room_members table only shows rows for
+ * rooms you belong to, so any row back means yes.
+ */
+async function isRoomMember(roomId, token) {
+  if (!token) return false;
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/room_members?select=room_id&room_id=eq.${roomId.toLowerCase()}&limit=1`;
+    const res = await fetch(url, {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return false;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows.length > 0;
+  } catch (err) {
+    console.error('membership check failed', err.message);
+    return false;
+  }
+}
+
+/** roomId -> Set<socket> of home screens watching who's in that room */
+const watchers = new Map();
+
+function occupancyOf(roomId) {
+  const room = rooms.get(roomId);
+  return room ? [...room.values()].map((p) => p.name) : [];
+}
+
+function broadcastOccupancy(roomId) {
+  const set = watchers.get(roomId);
+  if (!set) return;
+  const people = occupancyOf(roomId);
+  for (const socket of set) send(socket, { type: 'occupancy', room: roomId, people });
+}
+
+function unwatchAll(client) {
+  for (const roomId of client.watching || []) {
+    const set = watchers.get(roomId);
+    if (!set) continue;
+    set.delete(client.socket);
+    if (set.size === 0) watchers.delete(roomId);
+  }
+  client.watching = new Set();
+}
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -102,6 +154,7 @@ function leaveRoom(client) {
   }
 
   client.roomId = null;
+  broadcastOccupancy(roomId);
 }
 
 // Phones that go to the background can vanish without closing their
@@ -124,7 +177,7 @@ wss.on('connection', (socket) => {
   socket.isAlive = true;
   socket.on('pong', () => { socket.isAlive = true; });
 
-  socket.on('message', (raw) => {
+  socket.on('message', async (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw);
@@ -134,8 +187,14 @@ wss.on('connection', (socket) => {
 
     switch (msg.type) {
       case 'join': {
-        const roomId = String(msg.room || '').toUpperCase().slice(0, 32);
+        const roomId = String(msg.room || '').toUpperCase().slice(0, 64);
         if (!roomId) return;
+
+        // Account rooms are private: only members get in.
+        if (UUID_RE.test(roomId) && !(await isRoomMember(roomId, msg.token))) {
+          send(socket, { type: 'denied' });
+          return;
+        }
 
         leaveRoom(client);
 
@@ -169,6 +228,23 @@ wss.on('connection', (socket) => {
 
         room.set(client.peerId, { socket, name: client.name });
         console.log(`[room ${roomId}] ${client.peerId} (${client.name}) joined, ${room.size} present`);
+        broadcastOccupancy(roomId);
+        break;
+      }
+
+      // Home screen: tell me who's in these rooms, now and as it changes.
+      case 'watch': {
+        unwatchAll(client);
+        const ids = (Array.isArray(msg.rooms) ? msg.rooms : [])
+          .slice(0, 100)
+          .map((r) => String(r).toUpperCase())
+          .filter((r) => UUID_RE.test(r));
+        for (const roomId of ids) {
+          if (!watchers.has(roomId)) watchers.set(roomId, new Set());
+          watchers.get(roomId).add(socket);
+          client.watching.add(roomId);
+          send(socket, { type: 'occupancy', room: roomId, people: occupancyOf(roomId) });
+        }
         break;
       }
 
@@ -203,8 +279,8 @@ wss.on('connection', (socket) => {
     }
   });
 
-  socket.on('close', () => leaveRoom(client));
-  socket.on('error', () => leaveRoom(client));
+  socket.on('close', () => { leaveRoom(client); unwatchAll(client); });
+  socket.on('error', () => { leaveRoom(client); unwatchAll(client); });
 });
 
 server.listen(PORT, () => {
