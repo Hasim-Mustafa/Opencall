@@ -357,6 +357,17 @@ select{cursor:pointer}
 .sheet .field:first-of-type{margin-top:14px}
 .sheet .field{margin-top:16px}
 .sheet-note{margin-top:16px;font-size:12.5px;color:var(--muted);line-height:1.55}
+.switch-row{display:flex;align-items:center;gap:14px;margin-top:18px;padding-top:16px;border-top:1px solid var(--line);cursor:pointer}
+.switch-row[hidden]{display:none}
+.switch-row span{flex:1}
+.switch-row b{display:block;font-weight:500;font-size:14.5px}
+.switch-row small{display:block;margin-top:3px;font-size:12px;color:var(--muted);line-height:1.5}
+.switch-row input{position:absolute;opacity:0;pointer-events:none}
+.switch-row i{flex:0 0 auto;width:44px;height:26px;border-radius:13px;background:var(--panel-2);border:1px solid var(--line);position:relative;transition:background .15s}
+.switch-row i::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:var(--muted);transition:transform .15s,background .15s}
+.switch-row input:checked + i{background:rgba(245,165,36,.25);border-color:rgba(245,165,36,.6)}
+.switch-row input:checked + i::after{transform:translateX(18px);background:var(--signal)}
+.switch-row input:focus-visible + i{outline:2px solid var(--signal);outline-offset:2px}
 .sheet-note:empty{display:none}
 
 .toast{
@@ -653,7 +664,7 @@ input[type=password]{
     </div>
   </div>
 </div>
-<audio id="ringtone" src="/sounds/ring.wav" loop preload="auto"></audio>
+<audio id="ringtone" src="/sounds/ring.mp3" loop preload="auto"></audio>
 
 <div class="sheet-back" id="modal" hidden>
   <div class="sheet" role="dialog">
@@ -810,6 +821,14 @@ input[type=password]{
       <label class="label" for="callCam">Camera</label>
       <select id="callCam"></select>
     </div>
+    <label class="switch-row" id="pipRow" hidden>
+      <span>
+        <b>Floating window</b>
+        <small>Show the call in a small window when you leave the app. Off: the call keeps going in the background with just a notification.</small>
+      </span>
+      <input type="checkbox" id="pipToggle">
+      <i aria-hidden="true"></i>
+    </label>
     <p class="sheet-note" id="sheetNote"></p>
   </div>
 </div>
@@ -901,7 +920,7 @@ async function startPreview() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      video: IS_MOBILE ? { facingMode: { ideal: "user" } } : true,
+      video: IS_MOBILE ? { ...VIDEO_QUALITY, facingMode: { ideal: "user" } } : { ...VIDEO_QUALITY },
     });
     state.localStream = stream;
     state.camStream = stream;
@@ -1036,9 +1055,56 @@ function constraintsFor(kind, choice) {
     return { audio: choice === "default" ? base : { ...base, deviceId: { exact: choice } } };
   }
   if (choice.startsWith("facing:")) {
-    return { video: { facingMode: { exact: choice.slice(7) } } };
+    return { video: { ...VIDEO_QUALITY, facingMode: { exact: choice.slice(7) } } };
   }
-  return { video: choice === "default" ? true : { deviceId: { exact: choice } } };
+  return { video: choice === "default" ? { ...VIDEO_QUALITY } : { ...VIDEO_QUALITY, deviceId: { exact: choice } } };
+}
+
+/* -------------------------------------------------------- call quality
+
+   Ask cameras for 720p at a steady 30fps, then cap what each connection
+   sends so it fits the link. With more people each stream gets a smaller
+   share, because in a group call every phone uploads to everyone. When the
+   network struggles, keep the frame rate (motion stays smooth) and drop
+   resolution instead; audio always gets priority over video. */
+const VIDEO_QUALITY = {
+  width: { ideal: 1280 }, height: { ideal: 720 },
+  frameRate: { ideal: 30, max: 30 },
+};
+
+function videoBudget() {
+  const n = Math.max(1, state.peers.size);
+  return n === 1 ? 1_500_000 : n === 2 ? 900_000 : n <= 3 ? 650_000 : 450_000;
+}
+
+async function tuneSenders(pc) {
+  for (const sender of pc.getSenders()) {
+    const track = sender.track;
+    if (!track) continue;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+      if (track.kind === "audio") {
+        params.encodings[0].priority = "high";
+        params.encodings[0].networkPriority = "high";
+        params.encodings[0].maxBitrate = 64_000;
+      } else {
+        const screen = state.sharing && state.screenStream && state.screenStream.getVideoTracks()[0] === track;
+        track.contentHint = screen ? "detail" : "motion";
+        params.degradationPreference = screen ? "maintain-resolution" : "maintain-framerate";
+        params.encodings[0].maxBitrate = screen ? Math.max(videoBudget(), 1_200_000) : videoBudget();
+        params.encodings[0].maxFramerate = screen ? 15 : 30;
+        params.encodings[0].priority = "low";
+      }
+      await sender.setParameters(params);
+    } catch (e) {
+      // Older WebViews may reject some fields; the defaults still work.
+    }
+  }
+}
+
+function tuneAll() {
+  for (const peer of state.peers.values()) tuneSenders(peer.pc);
 }
 
 // The sender carrying audio or video to a peer. Found through the receiver
@@ -1095,6 +1161,7 @@ async function swapDevice(kind, choice) {
         const sender = senderFor(peer.pc, kind);
         if (sender) await sender.replaceTrack(newTrack);
       }
+      tuneAll();
     }
 
     if (kind === "video") {
@@ -1217,6 +1284,8 @@ $("btnFlip").onclick = async () => {
 
 $("btnDevices").onclick = async () => {
   await listDevices();
+  $("pipRow").hidden = !(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+  $("pipToggle").checked = pipOn();
   $("sheetNote").textContent = IS_MOBILE
     ? "Speaker, earpiece and Bluetooth are switched by your phone. Connect or disconnect headphones and the call follows."
     : "";
@@ -1256,7 +1325,12 @@ function meterMic(stream) {
   const buf = new Uint8Array(analyser.frequencyBinCount);
   const bars = $("levels").children;
 
-  (function loop() {
+  let last = 0;
+  (function loop(now) {
+    if (token !== state.meterToken) return;
+    requestAnimationFrame(loop);
+    if (document.hidden || now - last < 66) return;
+    last = now;
     analyser.getByteFrequencyData(buf);
     let sum = 0;
     for (let i = 0; i < buf.length; i++) sum += buf[i];
@@ -1268,8 +1342,7 @@ function meterMic(stream) {
     }
     const selfTile = document.querySelector(".tile.self");
     if (selfTile) selfTile.style.setProperty("--level", (level * 0.9).toFixed(2));
-    if (token === state.meterToken) requestAnimationFrame(loop);
-  })();
+  })(0);
 }
 
 // Camera and mic are requested when you join a room, not on app open.
@@ -1400,7 +1473,7 @@ function enterCall() {
   startBackgroundCall();
   // Tells the Android app to shrink into a floating window, not vanish,
   // when you leave it mid-call.
-  document.title = "GMST \u00b7 In call";
+  applyCallTitle();
   if (state.calling) startRingback();
   paintControls();
   updateCount();
@@ -1463,13 +1536,19 @@ async function startBackgroundCall() {
     });
     await FGS.startForegroundService({
       id: 1,
-      title: "In a call",
-      body: state.roomName || "GMST",
+      title: "In a call · " + (state.roomName || "GMST"),
+      body: "Tap to return to the call",
       smallIcon: "ic_stat_gmst",
       notificationChannelId: "call",
       serviceType: 128, // microphone
       silent: true,
+      buttons: [{ id: 1, title: "Hang up" }],
     });
+    if (!state.fgsListener) {
+      state.fgsListener = await FGS.addListener("buttonClicked", ({ buttonId }) => {
+        if (buttonId === 1) $("btnLeave").click();
+      });
+    }
   } catch (e) {
     console.warn("Background calling unavailable:", e);
   }
@@ -1607,6 +1686,7 @@ function createPeer(id, name) {
 
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
+    if (s === "connected") tuneAll();
     if (s === "failed") {
       setReadout(tile, "failed", "no route");
       // A failed ICE run usually means both sides are behind strict NAT
@@ -1663,6 +1743,20 @@ function sendTo(id, data) {
   state.ws?.send(JSON.stringify({ type: "signal", to: id, data }));
 }
 
+/* The Android app reads the page title to decide whether leaving the app
+   should shrink the call into a floating window. */
+const PIP_KEY = "gmst.pip";
+const pipOn = () => { try { return localStorage.getItem(PIP_KEY) !== "off"; } catch { return true; } };
+function applyCallTitle() {
+  document.title = pipOn() ? "GMST \u00b7 In call" : "GMST \u00b7 Call (background)";
+}
+$("pipToggle").checked = pipOn();
+$("pipToggle").onchange = (e) => {
+  try { localStorage.setItem(PIP_KEY, e.target.checked ? "on" : "off"); } catch {}
+  if ($("call").classList.contains("live")) applyCallTitle();
+  toast(e.target.checked ? "Floating window on" : "Floating window off");
+};
+
 function broadcastState() {
   state.ws?.send(JSON.stringify({
     type: "state",
@@ -1671,6 +1765,7 @@ function broadcastState() {
 }
 
 function dropPeer(id) {
+  setTimeout(tuneAll, 0);
   const peer = state.peers.get(id);
   if (!peer) return;
   clearInterval(peer.statsTimer);
@@ -1797,15 +1892,18 @@ function attachRing(tile, stream) {
   src.connect(analyser);
   const buf = new Uint8Array(analyser.frequencyBinCount);
 
-  (function loop() {
+  let last = 0;
+  (function loop(now) {
     if (!tile.isConnected) return;
+    requestAnimationFrame(loop);
+    if (document.hidden || now - last < 66) return;
+    last = now;
     analyser.getByteFrequencyData(buf);
     let sum = 0;
     for (let i = 0; i < buf.length; i++) sum += buf[i];
     const level = Math.min(1, sum / buf.length / 55);
     tile.style.setProperty("--level", (level * 0.9).toFixed(2));
-    requestAnimationFrame(loop);
-  })();
+  })(0);
 }
 
 // -------------------------------------------------------- call controls
@@ -1842,7 +1940,7 @@ $("btnShare").onclick = async () => {
   if (state.sharing) return stopSharing();
   try {
     const screen = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: 15 },
+      video: { frameRate: { ideal: 15, max: 15 } },
       audio: false,
     });
     state.screenStream = screen;
@@ -1851,9 +1949,10 @@ $("btnShare").onclick = async () => {
 
     // Swap the outgoing video track on every open connection.
     for (const peer of state.peers.values()) {
-      const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === "video");
+      const sender = senderFor(peer.pc, "video");
       if (sender) await sender.replaceTrack(track);
     }
+    tuneAll();
     document.querySelector(".tile.self video").srcObject = screen;
     track.onended = stopSharing; // the browser's own "Stop sharing" bar
     paintControls();
@@ -1871,9 +1970,10 @@ async function stopSharing() {
 
   const camTrack = state.localStream.getVideoTracks()[0];
   for (const peer of state.peers.values()) {
-    const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === "video");
+    const sender = senderFor(peer.pc, "video");
     if (sender && camTrack) await sender.replaceTrack(camTrack);
   }
+  tuneAll();
   document.querySelector(".tile.self video").srcObject = state.localStream;
   paintControls();
   broadcastState();
@@ -2074,6 +2174,7 @@ if ("serviceWorker" in navigator) {
     await redeemPendingInvite();
     setupPush();
     runAutojoin();
+    checkNative();
   }
 
   $("signOut").onclick = async () => {
@@ -2145,7 +2246,12 @@ if ("serviceWorker" in navigator) {
 
   // Friend requests and room changes made by others show up within seconds.
   setInterval(() => !document.hidden && refresh(), 15000);
-  document.addEventListener("visibilitychange", () => !document.hidden && refresh());
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    refresh();
+    resyncRings();
+    checkNative();
+  });
 
   // ------------------------------------------------ live room occupancy
 
@@ -2173,6 +2279,7 @@ if ("serviceWorker" in navigator) {
           break;
         case "incoming": showIncoming(m); break;
         case "ring-cancel": cancelIncoming(m); break;
+        case "rings": syncIncoming(m.active || []); break;
         case "ringing": joinCall(m.call, "@" + m.to, true); break;
         case "ringing-room": toast(`Ringing ${m.count} ${m.count === 1 ? "person" : "people"}`); break;
         case "ring-failed":
@@ -2572,17 +2679,27 @@ if ("serviceWorker" in navigator) {
     if (navigator.vibrate) navigator.vibrate(0);
   }
 
+  // With the native call screen available (APK + Firebase), a hidden app
+  // leaves ringing to it rather than ringing twice.
+  const nativeRings = () => !!(Push && pushReady && app.pushToken);
+
   function showIncoming(m) {
+    if (inCall() && incoming && incoming.call === m.call && incoming.room === m.room) return;
+    if (document.hidden && nativeRings()) return;
+    const remaining = (m.expiresAt || Date.now() + 45000) - Date.now();
+    if (remaining < 1000) return;
+    const same = incoming && incoming.call === m.call && incoming.room === m.room;
     incoming = { ...m, at: Date.now() };
     const room = m.kind === "room";
-    $("incAv").textContent = (room ? m.roomName : m.from)[0].toUpperCase();
+    $("incAv").textContent = ((room ? m.roomName : m.from) || "?")[0].toUpperCase();
     $("incKind").textContent = room ? "Group call" : "Incoming call";
     $("incWho").textContent = room ? m.roomName : "@" + m.from;
     $("incWhat").textContent = room ? `@${m.from} started a call` : "is calling you";
     $("incoming").hidden = false;
-    startRinging();
+    clearNativeRing(m);
+    if (!same || $("ringtone").paused) startRinging();
     clearTimeout(incoming.timer);
-    incoming.timer = setTimeout(() => cancelIncoming({ call: m.call, room: m.room }), 50000);
+    incoming.timer = setTimeout(() => cancelIncoming({ call: m.call, room: m.room, reason: "no-answer" }), remaining);
   }
 
   function hideIncoming() {
@@ -2598,11 +2715,72 @@ if ("serviceWorker" in navigator) {
     const who = incoming.kind === "room" ? incoming.roomName : "@" + incoming.from;
     hideIncoming();
     incoming = null;
-    toast(`Missed call from ${who}`);
+    if (m.reason !== "answered" && m.reason !== "declined") toast(`Missed call from ${who}`);
   }
+
+  // The server's list of what's ringing right now. Anything showing that
+  // isn't on it has already stopped.
+  function syncIncoming(active) {
+    if (incoming && !active.some((a) => a.call === incoming.call && a.room === incoming.room)) {
+      hideIncoming();
+      incoming = null;
+    }
+    const pending = nativePending;
+    if (pending && pending.action === "accept") return; // answering now
+    for (const a of active) {
+      if (inCall()) break;
+      showIncoming(a);
+      break;
+    }
+  }
+
+  function resyncRings() {
+    if (app.ws && app.ws.readyState === 1) watchRooms();
+  }
+
+  // Remove the phone's own ringing notification once the app has taken over.
+  function clearNativeRing(m) {
+    if (!Push) return;
+    const tag = "ring:" + (m.call || m.room || "");
+    Push.removeDeliveredNotifications({ notifications: [{ id: 7001, tag }] }).catch(() => {});
+  }
+
+  // ---- hand-off from the native call screen (Accept on the notification)
+
+  const Prefs = Native && Native.registerPlugin ? Native.registerPlugin("Preferences") : null;
+  let nativePending = null;
+
+  async function checkNative() {
+    if (!Prefs || !app.me) return;
+    let raw = null;
+    try {
+      raw = (await Prefs.get({ key: "gmst.native" })).value;
+      if (raw) await Prefs.remove({ key: "gmst.native" });
+    } catch { return; }
+    if (!raw) return;
+    let a;
+    try { a = JSON.parse(raw); } catch { return; }
+    if (!a || Date.now() - (a.at || 0) > 90000) return; // stale
+    if (a.action === "accept") {
+      nativePending = a;
+      hideIncoming();
+      incoming = null;
+      clearNativeRing(a);
+      const m = a.kind === "room" || (!a.call && a.room)
+        ? { kind: "room", room: a.room, roomName: a.roomName }
+        : { kind: "direct", call: a.call, from: a.from };
+      answer(m);
+      setTimeout(() => (nativePending = null), 5000);
+    } else {
+      // Opened from the ringing notification: show the in-app call screen.
+      resyncRings();
+    }
+  }
+  window.gmstNative = () => { checkNative(); };
 
   $("incDecline").onclick = () => {
     if (!incoming) return hideIncoming();
+    clearNativeRing(incoming);
     sendHome({ type: "decline", call: incoming.call, room: incoming.room });
     hideIncoming();
     incoming = null;
@@ -2655,15 +2833,12 @@ if ("serviceWorker" in navigator) {
       let perm = await Push.checkPermissions();
       if (perm.receive !== "granted") perm = await Push.requestPermissions();
       if (perm.receive !== "granted") return;
-      await Push.createChannel({
-        id: "ring", name: "Incoming calls", description: "Rings when a friend calls you",
-        importance: 5, visibility: 1, sound: "ring.wav", vibration: true, lights: true,
+      // The ringing itself is done by the phone's own call code; this just
+      // registers where Google should deliver calls for this phone.
+      await Push.addListener("registration", ({ value }) => {
+        app.pushToken = value;
+        sb.rpc("register_push_token", { t: value });
       });
-      await Push.createChannel({
-        id: "missed", name: "Missed calls", description: "Calls you didn't pick up",
-        importance: 3, visibility: 1,
-      });
-      await Push.addListener("registration", ({ value }) => sb.rpc("register_push_token", { t: value }));
       await Push.addListener("registrationError", (e) => console.warn("push registration failed", e));
       // Tapping a ringing notification answers the call.
       await Push.addListener("pushNotificationActionPerformed", ({ notification }) => {

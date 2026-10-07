@@ -11,7 +11,7 @@
  * Bump CACHE_VERSION whenever you change index.html.
  */
 
-const CACHE_VERSION = "gmst-v9";
+const CACHE_VERSION = "gmst-v10";
 
 const SHELL = [
   "/",
