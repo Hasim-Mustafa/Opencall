@@ -1,7 +1,7 @@
 name: Build Android APK
 
-# Run it by hand from the Actions tab, or automatically when the Android
-# config changes. Normal web edits don't need a rebuild — the app loads the
+# Run by hand from the Actions tab, or automatically when the Android
+# config changes. Normal web edits don't need a rebuild: the app loads the
 # live site, so changes to index.html reach installed phones immediately.
 on:
   workflow_dispatch:
@@ -9,6 +9,8 @@ on:
     paths:
       - 'capacitor.config.json'
       - '.github/workflows/android.yml'
+      - 'public/icons/ic_stat_gmst.png'
+      - 'public/sounds/ring.wav'
 
 permissions:
   contents: read
@@ -20,29 +22,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The signing key lives in repository secrets, never in the code.
+      - name: Check the signing key is set up
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::error::Missing KEYSTORE_BASE64 or KEYSTORE_PASSWORD in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      # Firebase lets a closed app ring. Optional: without it the APK still
+      # builds, and calls ring only while the app is open.
+      - name: Check for Firebase
+        id: firebase
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Firebase found: closed apps will ring."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No GOOGLE_SERVICES_JSON secret. Building without ringing for closed apps."
+          fi
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '21'
 
-      # Capacitor is only needed to build the wrapper, so it is not added to
-      # package.json. Keeping it out means Render's deploy stays fast.
-      - name: Install Capacitor
+      - name: Install Capacitor and plugins
         run: |
           npm install
-          npm install --no-save \
-            @capacitor/core @capacitor/cli @capacitor/android
+          npm install \
+            @capacitor/core@8 @capacitor/cli@8 @capacitor/android@8 \
+            @capawesome-team/capacitor-android-foreground-service@8
+          if [ "${{ steps.firebase.outputs.enabled }}" = "true" ]; then
+            npm install @capacitor/push-notifications@8
+          fi
 
       - name: Generate the Android project
         run: npx cap add android
 
-      # Launcher icon and splash, built from the PNGs already in the repo.
       - name: Apply app icon and splash
         run: |
           mkdir -p assets
@@ -51,12 +80,27 @@ jobs:
           cp public/icons/splash-2732.png assets/splash-dark.png
           npx @capacitor/assets generate --android
 
-      # Capacitor's generated manifest has no camera or mic permission.
-      # Without these, getUserMedia fails silently inside the app.
-      - name: Add camera and microphone permissions
+      - name: Notification icon and ringtone
+        run: |
+          mkdir -p android/app/src/main/res/drawable android/app/src/main/res/raw
+          cp public/icons/ic_stat_gmst.png android/app/src/main/res/drawable/ic_stat_gmst.png
+          cp public/sounds/ring.wav android/app/src/main/res/raw/ring.wav
+
+      - name: Firebase config
+        if: steps.firebase.outputs.enabled == 'true'
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+          python3 -c "import json; d=json.load(open('android/app/google-services.json')); print('project:', d['project_info']['project_id']); assert any(c['client_info']['android_client_info']['package_name']=='com.hasim.opencall' for c in d['client']), 'google-services.json is for a different package name. In Firebase, the Android app must be com.hasim.opencall'"
+
+      # Only what a calling app needs: camera, microphone, network,
+      # notifications, and the background call service. No contacts,
+      # storage, location, SMS or screen overlay.
+      - name: Permissions, background service, backup off
         run: |
           python3 - <<'PY'
-          import re, pathlib
+          import pathlib, re
 
           p = pathlib.Path('android/app/src/main/AndroidManifest.xml')
           xml = p.read_text()
@@ -66,24 +110,84 @@ jobs:
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-feature android:name="android.hardware.camera" android:required="false" />
               <uses-feature android:name="android.hardware.microphone" android:required="false" />
           """
-
-          if 'android.permission.CAMERA' not in xml:
+          if 'FOREGROUND_SERVICE_MICROPHONE' not in xml:
               xml = xml.replace('</manifest>', perms + '\n</manifest>')
-              p.write_text(xml)
-              print('permissions added')
-          else:
-              print('permissions already present')
 
+          service = """
+                  <receiver android:name="io.capawesome.capacitorjs.plugins.foregroundservice.NotificationActionBroadcastReceiver" android:exported="false" />
+                  <service android:name="io.capawesome.capacitorjs.plugins.foregroundservice.AndroidForegroundService" android:exported="false" android:foregroundServiceType="microphone" />
+          """
+          if 'AndroidForegroundService' not in xml:
+              xml = xml.replace('</application>', service + '\n    </application>')
+
+          xml = re.sub(r'android:allowBackup="true"', 'android:allowBackup="false"', xml)
+          if 'android:allowBackup' not in xml:
+              xml = xml.replace('<application', '<application android:allowBackup="false"', 1)
+
+          p.write_text(xml)
           print(xml)
           PY
 
-      # Some dependencies pull in kotlin-stdlib-jdk8 1.6.x alongside
-      # kotlin-stdlib 1.8.x, which fails with "Duplicate class" errors.
-      # The Kotlin BOM aligns every kotlin-stdlib artifact to one version.
+      # The call shrinks into a floating window when you leave the app.
+      - name: Picture-in-picture
+        run: |
+          f=$(find android/app/src/main/java -name MainActivity.java | head -1)
+          echo "Replacing $f"
+          cat > "$f" <<'JAVA'
+          package com.hasim.opencall;
+
+          import android.app.PictureInPictureParams;
+          import android.os.Build;
+          import android.util.Rational;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+
+              private static final String IN_CALL_TITLE = "GMST · In call";
+
+              @Override
+              protected void onUserLeaveHint() {
+                  super.onUserLeaveHint();
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && inCall()) {
+                      try {
+                          PictureInPictureParams params = new PictureInPictureParams.Builder()
+                              .setAspectRatio(new Rational(9, 16))
+                              .build();
+                          enterPictureInPictureMode(params);
+                      } catch (Exception ignored) {
+                      }
+                  }
+              }
+
+              private boolean inCall() {
+                  try {
+                      String title = getBridge().getWebView().getTitle();
+                      return title != null && title.startsWith(IN_CALL_TITLE);
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+          }
+          JAVA
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path('android/app/src/main/AndroidManifest.xml')
+          xml = p.read_text()
+          if 'supportsPictureInPicture' not in xml:
+              xml = re.sub(r'(<activity\b(?:(?!>).)*?MainActivity")', r'\1 android:supportsPictureInPicture="true"', xml, count=1, flags=re.S)
+          assert 'supportsPictureInPicture="true"' in xml, 'could not mark MainActivity for picture-in-picture'
+          p.write_text(xml)
+          print('MainActivity supports picture-in-picture')
+          PY
+
+      # Avoids "Duplicate class kotlin..." errors from mixed Kotlin versions.
       - name: Align Kotlin versions
         run: |
           cat >> android/app/build.gradle <<'GRADLE'
@@ -92,18 +196,48 @@ jobs:
               implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
           }
           GRADLE
-          tail -n 6 android/app/build.gradle
+
+      # Release build signed with your own permanent key, so updates install
+      # over each other and nobody else can publish an "update".
+      - name: Signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/gmst.p12
+          cat >> android/app/build.gradle <<'GRADLE'
+
+          android {
+              signingConfigs {
+                  gmst {
+                      storeFile file("gmst.p12")
+                      storeType "pkcs12"
+                      storePassword System.getenv("KEYSTORE_PASSWORD")
+                      keyAlias "gmst"
+                      keyPassword System.getenv("KEYSTORE_PASSWORD")
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.gmst
+                      debuggable false
+                  }
+              }
+          }
+          GRADLE
 
       - name: Build the APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleRelease --no-daemon
 
       - name: Rename it
         run: |
           mkdir -p out
-          cp android/app/build/outputs/apk/debug/app-debug.apk out/GMST.apk
+          cp android/app/build/outputs/apk/release/app-release.apk out/GMST.apk
+          rm -f android/app/gmst.p12
           ls -lh out/
 
       - name: Upload
