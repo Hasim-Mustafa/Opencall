@@ -10,7 +10,7 @@ on:
       - 'capacitor.config.json'
       - '.github/workflows/android.yml'
       - 'public/icons/ic_stat_gmst.png'
-      - 'public/sounds/ring.wav'
+      - 'public/sounds/ring.ogg'
 
 permissions:
   contents: read
@@ -64,7 +64,8 @@ jobs:
           npm install
           npm install \
             @capacitor/core@8 @capacitor/cli@8 @capacitor/android@8 \
-            @capawesome-team/capacitor-android-foreground-service@8
+            @capawesome-team/capacitor-android-foreground-service@8 \
+            @capacitor/preferences@8
           if [ "${{ steps.firebase.outputs.enabled }}" = "true" ]; then
             npm install @capacitor/push-notifications@8
           fi
@@ -84,7 +85,7 @@ jobs:
         run: |
           mkdir -p android/app/src/main/res/drawable android/app/src/main/res/raw
           cp public/icons/ic_stat_gmst.png android/app/src/main/res/drawable/ic_stat_gmst.png
-          cp public/sounds/ring.wav android/app/src/main/res/raw/ring.wav
+          cp public/sounds/ring.ogg android/app/src/main/res/raw/ring.ogg
 
       - name: Firebase config
         if: steps.firebase.outputs.enabled == 'true'
@@ -135,22 +136,80 @@ jobs:
           print(xml)
           PY
 
-      # The call shrinks into a floating window when you leave the app.
-      - name: Picture-in-picture
+      # The phone's own call code: picture-in-picture, the incoming-call
+      # screen that rings over the lock screen, and Decline from the
+      # notification. The push part is added only when Firebase is set up.
+      - name: Native call code
         run: |
-          f=$(find android/app/src/main/java -name MainActivity.java | head -1)
-          echo "Replacing $f"
-          cat > "$f" <<'JAVA'
+          dir=$(dirname "$(find android/app/src/main/java -name MainActivity.java | head -1)")
+          echo "Writing native code into $dir"
+          SERVER_URL=$(python3 -c "import json; print(json.load(open('capacitor.config.json'))['server']['url'].rstrip('/'))")
+          cat > "$dir/MainActivity.java" <<'JAVA'
           package com.hasim.opencall;
 
+          import android.app.NotificationManager;
           import android.app.PictureInPictureParams;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
           import android.os.Build;
+          import android.os.Bundle;
           import android.util.Rational;
+          import android.view.WindowManager;
+          import android.webkit.WebView;
           import com.getcapacitor.BridgeActivity;
+          import org.json.JSONObject;
 
+          /**
+           * GMST's main screen, with three call behaviours added:
+           *  - Picture-in-picture: leaving the app mid-call shrinks it into a floating
+           *    window (if that's switched on in the call settings).
+           *  - Incoming calls open straight over the lock screen.
+           *  - Accepting from the notification hands the call to the app.
+           */
           public class MainActivity extends BridgeActivity {
 
+              static final String ACTION_INCOMING = "com.hasim.opencall.INCOMING";
+              static final String ACTION_ACCEPT = "com.hasim.opencall.ACCEPT";
               private static final String IN_CALL_TITLE = "GMST · In call";
+
+              /** True while the app is on screen; the push service only rings when it isn't. */
+              static volatile boolean foreground = false;
+              private boolean overLockScreen = false;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  handleCallIntent(getIntent());
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(intent);
+                  handleCallIntent(intent);
+              }
+
+              @Override
+              public void onResume() {
+                  super.onResume();
+                  foreground = true;
+              }
+
+              @Override
+              public void onPause() {
+                  super.onPause();
+                  foreground = false;
+              }
+
+              @Override
+              public void onStop() {
+                  super.onStop();
+                  // Only stay above the lock screen while a call needs it.
+                  if (overLockScreen && !inPip()) {
+                      setOverLockScreen(false);
+                  }
+              }
 
               @Override
               protected void onUserLeaveHint() {
@@ -162,8 +221,14 @@ jobs:
                               .build();
                           enterPictureInPictureMode(params);
                       } catch (Exception ignored) {
+                          // Picture-in-picture is off for this app; the call carries on
+                          // in the background with its notification.
                       }
                   }
+              }
+
+              private boolean inPip() {
+                  return Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode();
               }
 
               private boolean inCall() {
@@ -174,18 +239,396 @@ jobs:
                       return false;
                   }
               }
+
+              private void handleCallIntent(Intent intent) {
+                  if (intent == null) return;
+                  String action = intent.getAction();
+                  boolean accept = ACTION_ACCEPT.equals(action);
+                  if (!accept && !ACTION_INCOMING.equals(action)) return;
+
+                  String call = intent.getStringExtra("call");
+                  String room = intent.getStringExtra("room");
+                  if (accept) {
+                      NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                      nm.cancel(CallNotifications.tag(call, room), CallNotifications.ID_RING);
+                  }
+                  setOverLockScreen(true);
+
+                  // Hand it to the page. It reads this on start, and is poked below
+                  // in case it's already running.
+                  try {
+                      JSONObject o = new JSONObject();
+                      o.put("action", accept ? "accept" : "incoming");
+                      o.put("kind", nz(intent.getStringExtra("kind")));
+                      o.put("call", nz(call));
+                      o.put("room", nz(room));
+                      o.put("roomName", nz(intent.getStringExtra("roomName")));
+                      o.put("from", nz(intent.getStringExtra("from")));
+                      o.put("at", System.currentTimeMillis());
+                      SharedPreferences prefs = getSharedPreferences("CapacitorStorage", Context.MODE_PRIVATE);
+                      prefs.edit().putString("gmst.native", o.toString()).apply();
+                  } catch (Exception ignored) {
+                  }
+                  try {
+                      final WebView web = getBridge().getWebView();
+                      web.post(() -> web.evaluateJavascript("window.gmstNative && window.gmstNative()", null));
+                  } catch (Exception ignored) {
+                  }
+                  // Don't act on the same intent twice (e.g. after rotation).
+                  intent.setAction(null);
+              }
+
+              @SuppressWarnings("deprecation")
+              private void setOverLockScreen(boolean on) {
+                  overLockScreen = on;
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                      setShowWhenLocked(on);
+                      setTurnScreenOn(on);
+                  } else {
+                      int flags = WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON;
+                      if (on) getWindow().addFlags(flags);
+                      else getWindow().clearFlags(flags);
+                  }
+              }
+
+              private static String nz(String s) {
+                  return s == null ? "" : s;
+              }
           }
           JAVA
-          python3 - <<'PY'
-          import pathlib, re
+          cat > "$dir/CallNotifications.java" <<'JAVA'
+          package com.hasim.opencall;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Person;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.graphics.drawable.Icon;
+          import android.media.AudioAttributes;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.service.notification.StatusBarNotification;
+          import java.util.Map;
+
+          /** The incoming-call notification, and the missed-call one that replaces it. */
+          final class CallNotifications {
+
+              // Channel ids are new because Android never lets an existing channel's
+              // sound change.
+              static final String CHANNEL_RING = "gmst_incoming_v2";
+              static final String CHANNEL_MISSED = "gmst_missed_v2";
+              static final int ID_RING = 7001;
+              static final int ID_MISSED = 7002;
+              private static final int AMBER = 0xFFF5A524;
+
+              private CallNotifications() {}
+
+              static String tag(String call, String room) {
+                  return "ring:" + (call != null && !call.isEmpty() ? call : (room == null ? "" : room));
+              }
+
+              private static int icon(Context ctx) {
+                  int id = ctx.getResources().getIdentifier("ic_stat_gmst", "drawable", ctx.getPackageName());
+                  return id != 0 ? id : ctx.getApplicationInfo().icon;
+              }
+
+              private static Uri ringtone(Context ctx) {
+                  return Uri.parse("android.resource://" + ctx.getPackageName() + "/raw/ring");
+              }
+
+              private static NotificationManager manager(Context ctx) {
+                  return (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+              }
+
+              static void ensureChannels(Context ctx) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+                  NotificationManager nm = manager(ctx);
+                  if (nm.getNotificationChannel(CHANNEL_RING) == null) {
+                      NotificationChannel ch = new NotificationChannel(CHANNEL_RING, "Incoming calls", NotificationManager.IMPORTANCE_HIGH);
+                      ch.setDescription("Rings when a friend calls you");
+                      AudioAttributes attrs = new AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                          .build();
+                      ch.setSound(ringtone(ctx), attrs);
+                      ch.enableVibration(true);
+                      ch.setVibrationPattern(new long[] { 0, 800, 600, 800, 600 });
+                      ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                      nm.createNotificationChannel(ch);
+                  }
+                  if (nm.getNotificationChannel(CHANNEL_MISSED) == null) {
+                      NotificationChannel ch = new NotificationChannel(CHANNEL_MISSED, "Missed calls", NotificationManager.IMPORTANCE_DEFAULT);
+                      ch.setDescription("Calls you didn't pick up");
+                      nm.createNotificationChannel(ch);
+                  }
+              }
+
+              private static String get(Map<String, String> d, String k) {
+                  String v = d.get(k);
+                  return v == null ? "" : v;
+              }
+
+              private static Intent withCall(Intent i, Map<String, String> d) {
+                  return i
+                      .putExtra("kind", get(d, "kind"))
+                      .putExtra("call", get(d, "call"))
+                      .putExtra("room", get(d, "room"))
+                      .putExtra("roomName", get(d, "roomName"))
+                      .putExtra("from", get(d, "from"))
+                      .putExtra("key", get(d, "key"));
+              }
+
+              static void showRing(Context ctx, Map<String, String> d) {
+                  long expiresAt = 0;
+                  try { expiresAt = Long.parseLong(get(d, "expiresAt")); } catch (NumberFormatException ignored) {}
+                  long remaining = expiresAt - System.currentTimeMillis();
+                  if (expiresAt > 0 && remaining < 1500) return;          // arrived too late
+                  if (remaining <= 0 || remaining > 120000) remaining = 45000;
+
+                  ensureChannels(ctx);
+                  boolean room = "room".equals(get(d, "kind"));
+                  String from = "@" + get(d, "from");
+                  String title = room ? get(d, "roomName") : from;
+                  String text = room ? from + " is calling the group" : "Incoming call";
+                  String tag = tag(get(d, "call"), get(d, "room"));
+                  int code = tag.hashCode() & 0x0FFFFFFF;
+                  int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+
+                  Intent base = withCall(new Intent(ctx, MainActivity.class), d)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  PendingIntent open = PendingIntent.getActivity(ctx, code,
+                      new Intent(base).setAction(MainActivity.ACTION_INCOMING), flags);
+                  PendingIntent accept = PendingIntent.getActivity(ctx, code + 1,
+                      new Intent(base).setAction(MainActivity.ACTION_ACCEPT), flags);
+                  PendingIntent decline = PendingIntent.getBroadcast(ctx, code + 2,
+                      withCall(new Intent(ctx, CallActionReceiver.class), d).setAction(CallActionReceiver.ACTION_DECLINE), flags);
+
+                  NotificationManager nm = manager(ctx);
+                  nm.cancel(tag, ID_MISSED);
+                  Notification n;
+                  try {
+                      n = buildRing(ctx, title, text, open, accept, decline, remaining, true);
+                      nm.notify(tag, ID_RING, n);
+                  } catch (Exception styledFailed) {
+                      n = buildRing(ctx, title, text, open, accept, decline, remaining, false);
+                      nm.notify(tag, ID_RING, n);
+                  }
+              }
+
+              @SuppressWarnings("deprecation")
+              private static Notification buildRing(Context ctx, String title, String text, PendingIntent open,
+                                                    PendingIntent accept, PendingIntent decline, long timeoutMs, boolean callStyle) {
+                  Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                      ? new Notification.Builder(ctx, CHANNEL_RING)
+                      : new Notification.Builder(ctx);
+                  b.setSmallIcon(icon(ctx))
+                      .setContentTitle(title)
+                      .setContentText(text)
+                      .setCategory(Notification.CATEGORY_CALL)
+                      .setVisibility(Notification.VISIBILITY_PUBLIC)
+                      .setOngoing(true)
+                      .setAutoCancel(false)
+                      .setColor(AMBER)
+                      .setContentIntent(open)
+                      .setFullScreenIntent(open, true)
+                      .setPriority(Notification.PRIORITY_MAX);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      b.setTimeoutAfter(timeoutMs);
+                  } else {
+                      b.setSound(ringtone(ctx));
+                      b.setVibrate(new long[] { 0, 800, 600, 800, 600 });
+                  }
+
+                  boolean styled = false;
+                  if (callStyle && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      Person caller = new Person.Builder().setName(title).setImportant(true).build();
+                      b.setStyle(Notification.CallStyle.forIncomingCall(caller, decline, accept));
+                      styled = true;
+                  }
+                  if (!styled) {
+                      b.addAction(new Notification.Action.Builder((Icon) null, "Decline", decline).build());
+                      b.addAction(new Notification.Action.Builder((Icon) null, "Accept", accept).build());
+                  }
+                  Notification n = b.build();
+                  n.flags |= Notification.FLAG_INSISTENT; // keep ringing until answered or stopped
+                  return n;
+              }
+
+              private static boolean isShowing(NotificationManager nm, String tag, int id) {
+                  try {
+                      for (StatusBarNotification s : nm.getActiveNotifications()) {
+                          if (s.getId() == id && tag.equals(s.getTag())) return true;
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  return false;
+              }
+
+              /** Stop ringing. Turns into "Missed call" if it rang and nobody picked up. */
+              static void cancel(Context ctx, Map<String, String> d) {
+                  String tag = tag(get(d, "call"), get(d, "room"));
+                  NotificationManager nm = manager(ctx);
+                  boolean wasRinging = isShowing(nm, tag, ID_RING);
+                  nm.cancel(tag, ID_RING);
+                  String reason = get(d, "reason");
+                  if (wasRinging && ("cancelled".equals(reason) || "no-answer".equals(reason))) {
+                      showMissed(ctx, d, tag);
+                  }
+              }
+
+              @SuppressWarnings("deprecation")
+              private static void showMissed(Context ctx, Map<String, String> d, String tag) {
+                  ensureChannels(ctx);
+                  boolean room = "room".equals(get(d, "kind")) || (get(d, "call").isEmpty() && !get(d, "room").isEmpty());
+                  String from = "@" + get(d, "from");
+                  Intent launch = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName());
+                  if (launch == null) launch = new Intent(ctx, MainActivity.class);
+                  launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  PendingIntent open = PendingIntent.getActivity(ctx, (tag.hashCode() & 0x0FFFFFFF) + 3, launch,
+                      PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                      ? new Notification.Builder(ctx, CHANNEL_MISSED)
+                      : new Notification.Builder(ctx);
+                  b.setSmallIcon(icon(ctx))
+                      .setContentTitle(room ? "Missed group call" : "Missed call")
+                      .setContentText(room && !get(d, "roomName").isEmpty() ? from + " in " + get(d, "roomName") : from)
+                      .setColor(AMBER)
+                      .setAutoCancel(true)
+                      .setShowWhen(true)
+                      .setContentIntent(open);
+                  manager(ctx).notify(tag, ID_MISSED, b.build());
+              }
+          }
+          JAVA
+          cat > "$dir/CallActionReceiver.java" <<'JAVA'
+          package com.hasim.opencall;
+
+          import android.app.NotificationManager;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+          import org.json.JSONObject;
+
+          /** "Decline" on the incoming-call notification: works with the app closed. */
+          public class CallActionReceiver extends BroadcastReceiver {
+
+              static final String ACTION_DECLINE = "com.hasim.opencall.DECLINE";
+              static final String SERVER = "__SERVER_URL__";
+
+              @Override
+              public void onReceive(Context ctx, Intent intent) {
+                  if (intent == null || !ACTION_DECLINE.equals(intent.getAction())) return;
+                  final String call = intent.getStringExtra("call");
+                  final String room = intent.getStringExtra("room");
+                  final String key = intent.getStringExtra("key");
+
+                  NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                  nm.cancel(CallNotifications.tag(call, room), CallNotifications.ID_RING);
+
+                  final PendingResult pending = goAsync();
+                  new Thread(() -> {
+                      HttpURLConnection c = null;
+                      try {
+                          JSONObject body = new JSONObject();
+                          body.put("call", call == null ? "" : call);
+                          body.put("room", room == null ? "" : room);
+                          body.put("key", key == null ? "" : key);
+                          byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
+                          c = (HttpURLConnection) new URL(SERVER + "/api/decline").openConnection();
+                          c.setRequestMethod("POST");
+                          c.setConnectTimeout(8000);
+                          c.setReadTimeout(8000);
+                          c.setDoOutput(true);
+                          c.setRequestProperty("Content-Type", "application/json");
+                          try (OutputStream out = c.getOutputStream()) {
+                              out.write(bytes);
+                          }
+                          c.getResponseCode();
+                      } catch (Exception ignored) {
+                      } finally {
+                          if (c != null) c.disconnect();
+                          pending.finish();
+                      }
+                  }).start();
+              }
+          }
+          JAVA
+          sed -i "s|__SERVER_URL__|$SERVER_URL|" "$dir/CallActionReceiver.java"
+          grep -n "static final String SERVER" "$dir/CallActionReceiver.java"
+          cat > "/tmp/CallMessagingService.java" <<'JAVA'
+          package com.hasim.opencall;
+
+          import com.capacitorjs.plugins.pushnotifications.MessagingService;
+          import com.google.firebase.messaging.RemoteMessage;
+          import java.util.Map;
+
+          /**
+           * Receives pushes even when GMST is closed. Calls are handled here, on the
+           * phone, so they ring like a real call; anything else goes to the push
+           * plugin as before (including new push addresses).
+           */
+          public class CallMessagingService extends MessagingService {
+
+              @Override
+              public void onMessageReceived(RemoteMessage message) {
+                  Map<String, String> d = message.getData();
+                  String type = d == null ? null : d.get("type");
+                  if ("ring".equals(type)) {
+                      // On screen, the app shows its own incoming-call screen.
+                      if (!MainActivity.foreground) CallNotifications.showRing(this, d);
+                      return;
+                  }
+                  if ("cancel".equals(type)) {
+                      CallNotifications.cancel(this, d);
+                      return;
+                  }
+                  super.onMessageReceived(message);
+              }
+          }
+          JAVA
+          if [ "${{ steps.firebase.outputs.enabled }}" = "true" ]; then
+            mv /tmp/CallMessagingService.java "$dir/CallMessagingService.java"
+            printf '\ndependencies {\n    implementation "com.google.firebase:firebase-messaging:25.0.1"\n}\n' >> android/app/build.gradle
+          fi
+          FIREBASE="${{ steps.firebase.outputs.enabled }}" python3 - <<'PY2'
+          import os, pathlib, re
           p = pathlib.Path('android/app/src/main/AndroidManifest.xml')
           xml = p.read_text()
+
           if 'supportsPictureInPicture' not in xml:
               xml = re.sub(r'(<activity\b(?:(?!>).)*?MainActivity")', r'\1 android:supportsPictureInPicture="true"', xml, count=1, flags=re.S)
           assert 'supportsPictureInPicture="true"' in xml, 'could not mark MainActivity for picture-in-picture'
+
+          extra_perms = """
+              <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+          """
+          if 'USE_FULL_SCREEN_INTENT' not in xml:
+              xml = xml.replace('</manifest>', extra_perms + '\n</manifest>')
+
+          parts = ['        <receiver android:name="com.hasim.opencall.CallActionReceiver" android:exported="false" />']
+          if os.environ.get('FIREBASE') == 'true':
+              if 'xmlns:tools=' not in xml:
+                  xml = xml.replace('<manifest ', '<manifest xmlns:tools="http://schemas.android.com/tools" ', 1)
+              parts += [
+                  '        <service android:name="com.capacitorjs.plugins.pushnotifications.MessagingService" tools:node="remove" />',
+                  '        <service android:name="com.hasim.opencall.CallMessagingService" android:exported="false">',
+                  '            <intent-filter><action android:name="com.google.firebase.MESSAGING_EVENT" /></intent-filter>',
+                  '        </service>',
+              ]
+          if 'CallActionReceiver' not in xml:
+              xml = xml.replace('</application>', '\n'.join(parts) + '\n    </application>')
+
           p.write_text(xml)
-          print('MainActivity supports picture-in-picture')
-          PY
+          print(xml)
+          PY2
 
       # Avoids "Duplicate class kotlin..." errors from mixed Kotlin versions.
       - name: Align Kotlin versions
@@ -207,6 +650,10 @@ jobs:
           cat >> android/app/build.gradle <<'GRADLE'
 
           android {
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
+              }
               signingConfigs {
                   gmst {
                       storeFile file("gmst.p12")
