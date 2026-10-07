@@ -2832,14 +2832,27 @@ if ("serviceWorker" in navigator) {
     try {
       let perm = await Push.checkPermissions();
       if (perm.receive !== "granted") perm = await Push.requestPermissions();
-      if (perm.receive !== "granted") return;
+      if (perm.receive !== "granted") {
+        toast("Allow notifications for GMST so friends can ring you");
+        return;
+      }
       // The ringing itself is done by the phone's own call code; this just
       // registers where Google should deliver calls for this phone.
-      await Push.addListener("registration", ({ value }) => {
+      // Supabase only sends a request once its result is awaited.
+      await Push.addListener("registration", async ({ value }) => {
         app.pushToken = value;
-        sb.rpc("register_push_token", { t: value });
+        for (let attempt = 1; attempt <= 4; attempt++) {
+          const { error } = await sb.rpc("register_push_token", { t: value });
+          if (!error) return;
+          console.warn("saving push address failed", error);
+          await new Promise((r) => setTimeout(r, attempt * 3000));
+        }
+        toast("Couldn't set up ringing. Reopen the app to try again.");
       });
-      await Push.addListener("registrationError", (e) => console.warn("push registration failed", e));
+      await Push.addListener("registrationError", (e) => {
+        console.warn("push registration failed", e);
+        toast("Couldn't set up ringing on this phone");
+      });
       // Tapping a ringing notification answers the call.
       await Push.addListener("pushNotificationActionPerformed", ({ notification }) => {
         const d = notification && notification.data;
