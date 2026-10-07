@@ -17,6 +17,11 @@
       "backgroundColor": "#10141c",
       "androidScaleType": "CENTER_CROP",
       "showSpinner": false
+    },
+    "SystemBars": {
+      "insetsHandling": "css",
+      "style": "DARK"
     }
-  }
+  },
+  "appendUserAgent": "GMSTApp"
 }
