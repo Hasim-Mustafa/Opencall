@@ -155,11 +155,19 @@ async function dropPushToken(token) {
  *           nobody answered); turns into "Missed call" where that fits
  */
 async function pushTo(userIds, data, ttlSeconds) {
-  if (!FCM_SA || !SUPABASE_SECRET || !userIds.length) return;
+  if (!userIds.length) return;
+  if (!FCM_SA || !SUPABASE_SECRET) {
+    if (data.type === 'ring') console.log('[push] ring not sent: ringing closed apps is off (check FCM_SERVICE_ACCOUNT and SUPABASE_SECRET_KEY)');
+    return;
+  }
   try {
     const rows = await pushTokensFor(userIds);
-    if (!rows.length) return;
+    if (!rows.length) {
+      console.log(`[push] ${data.type} not sent: no phones registered for that person (they need the newest APK, opened once, with notifications allowed)`);
+      return;
+    }
     const access = await fcmAccessToken();
+    let sent = 0;
     await Promise.all(rows.map(async ({ token, user_id }) => {
       const payload = { ...data };
       // Each person gets their own key to decline from the notification.
@@ -173,15 +181,17 @@ async function pushTo(userIds, data, ttlSeconds) {
           message: { token, data: payload, android: { priority: 'HIGH', ttl: `${ttlSeconds}s` } },
         }),
       });
-      if (res.status === 404 || res.status === 400) {
+      if (res.ok) {
+        sent++;
+      } else {
         const t = await res.text();
+        console.error(`[push] Google refused the ${data.type} (${res.status}): ${t.slice(0, 200)}`);
         if (/UNREGISTERED|INVALID_ARGUMENT.*token/i.test(t)) dropPushToken(token);
-      } else if (!res.ok) {
-        console.error('fcm send failed', res.status);
       }
     }));
+    console.log(`[push] ${data.type} delivered to Google for ${sent} of ${rows.length} phone(s)`);
   } catch (err) {
-    console.error('push failed:', err.message);
+    console.error('[push] failed:', err.message);
   }
 }
 
