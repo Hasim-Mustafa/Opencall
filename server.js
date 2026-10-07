@@ -148,42 +148,29 @@ async function dropPushToken(token) {
 }
 
 /**
- * Wake these users' phones. kind 'ring' shows the incoming-call
- * notification with the ringtone; kind 'missed' replaces it (same tag)
- * once the call stops ringing, so a stale "is calling" never lingers.
+ * Wake these users' phones. Messages are data-only, so the phone's own
+ * call code decides what to show:
+ *   ring    the full incoming-call screen, ringing until answered
+ *   cancel  stop ringing now (answered elsewhere, caller hung up, declined,
+ *           nobody answered); turns into "Missed call" where that fits
  */
-async function pushTo(userIds, kind, info) {
-  if (!FCM_SA || !SUPABASE_SECRET) return;
+async function pushTo(userIds, data, ttlSeconds) {
+  if (!FCM_SA || !SUPABASE_SECRET || !userIds.length) return;
   try {
     const rows = await pushTokensFor(userIds);
     if (!rows.length) return;
     const access = await fcmAccessToken();
-    const title = kind === 'ring'
-      ? (info.roomName ? `${info.roomName}: @${info.from} is calling` : `@${info.from} is calling`)
-      : (info.roomName ? `Missed call in ${info.roomName}` : `Missed call from @${info.from}`);
-    const body = kind === 'ring' ? 'Tap to answer' : 'Tap to open GMST';
-    await Promise.all(rows.map(async ({ token }) => {
+    await Promise.all(rows.map(async ({ token, user_id }) => {
+      const payload = { ...data };
+      // Each person gets their own key to decline from the notification.
+      if (data.type === 'ring' && data.keys) payload.key = data.keys[user_id] || '';
+      delete payload.keys;
+      for (const k of Object.keys(payload)) payload[k] = String(payload[k] ?? '');
       const res = await fetch(`${FCM_BASE}/v1/projects/${FCM_SA.project_id}/messages:send`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: {
-            token,
-            data: {
-              type: kind, call: info.call || '', room: info.room || '',
-              roomName: info.roomName || '', from: info.from,
-            },
-            notification: { title, body },
-            android: {
-              priority: 'HIGH',
-              ttl: kind === 'ring' ? `${RING_MS / 1000}s` : '86400s',
-              notification: {
-                channel_id: kind === 'ring' ? 'ring' : 'missed',
-                tag: info.call || info.room,
-                visibility: 'PUBLIC',
-              },
-            },
-          },
+          message: { token, data: payload, android: { priority: 'HIGH', ttl: `${ttlSeconds}s` } },
         }),
       });
       if (res.status === 404 || res.status === 400) {
@@ -197,6 +184,8 @@ async function pushTo(userIds, kind, info) {
     console.error('push failed:', err.message);
   }
 }
+
+const newKey = () => crypto.randomBytes(16).toString('hex');
 
 // ============================================================ HTTP
 
@@ -254,7 +243,38 @@ function securityHeaders(req) {
   };
 }
 
+/**
+ * Declining from the notification while the app is closed. The phone has
+ * no login there, so it proves itself with the one-time key that came in
+ * that call's ring push.
+ */
+function handleDecline(req, res) {
+  let body = '';
+  req.on('data', (c) => {
+    body += c;
+    if (body.length > 2048) req.destroy();
+  });
+  req.on('end', () => {
+    let msg = {};
+    try { msg = JSON.parse(body); } catch {}
+    const key = String(msg.key || '');
+    const ok = (a, b) => a.length === b.length && a.length > 0 && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+    const call = calls.get(String(msg.call || '').toUpperCase());
+    if (call && !call.answered && ok(key, call.key)) endRinging(String(msg.call).toUpperCase(), 'declined');
+    const roomId = String(msg.room || '').toUpperCase();
+    const ring = roomRings.get(roomId);
+    if (ring) {
+      for (const [userId, k] of ring.waiting) if (ok(key, k)) stopRoomRing(roomId, userId, 'declined');
+    }
+    res.writeHead(204, securityHeaders(req)).end();
+  });
+}
+
 const server = http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/api/decline') {
+    handleDecline(req, res);
+    return;
+  }
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, securityHeaders(req)).end();
     return;
@@ -327,7 +347,7 @@ const userSockets = new Map();
  * callee:{id,name}, answered, timer }
  */
 const calls = new Map();
-/** Group rings. roomId -> { from, roomName, waiting:Set<userId>, timer } */
+/** Group rings. roomId -> { from, roomName, waiting:Map<userId, declineKey>, timer, expiresAt } */
 const roomRings = new Map();
 
 function toUser(userId, payload) {
@@ -345,6 +365,22 @@ function toRoom(roomId, payload) {
   for (const p of (rooms.get(roomId) || new Map()).values()) send(p.socket, payload);
 }
 
+/** Everything currently ringing for this person (used to re-sync phones). */
+function incomingFor(userId) {
+  const out = [];
+  for (const [callId, call] of calls) {
+    if (!call.answered && call.callee.id === userId) {
+      out.push({ type: 'incoming', kind: 'direct', call: callId, from: call.caller.name, expiresAt: call.expiresAt });
+    }
+  }
+  for (const [roomId, ring] of roomRings) {
+    if (ring.waiting.has(userId)) {
+      out.push({ type: 'incoming', kind: 'room', room: roomId, roomName: ring.roomName, from: ring.from, expiresAt: ring.expiresAt });
+    }
+  }
+  return out;
+}
+
 /** A direct call stopped ringing: tell everyone involved and clean up. */
 function endRinging(callId, reason) {
   const call = calls.get(callId);
@@ -352,17 +388,28 @@ function endRinging(callId, reason) {
   clearTimeout(call.timer);
   call.answered = true; // stops further ringing logic
   call.ended = true;    // the callee can no longer pick up
-  toUser(call.callee.id, { type: 'ring-cancel', call: callId });
+  toUser(call.callee.id, { type: 'ring-cancel', call: callId, reason });
   toRoom(callId, { type: 'call-update', status: reason, who: call.callee.name });
-  if (reason !== 'declined') pushTo([call.callee.id], 'missed', { call: callId, from: call.caller.name });
+  pushTo([call.callee.id], { type: 'cancel', call: callId, reason, from: call.caller.name }, 120);
   if (!rooms.get(callId)) calls.delete(callId);
 }
 
-function stopRoomRing(roomId, userId) {
+/** The person being called picked up: stop their other devices ringing. */
+function answeredCall(callId) {
+  const call = calls.get(callId);
+  if (!call || call.answered) return;
+  clearTimeout(call.timer);
+  call.answered = true;
+  toUser(call.callee.id, { type: 'ring-cancel', call: callId, reason: 'answered' });
+  pushTo([call.callee.id], { type: 'cancel', call: callId, reason: 'answered' }, 120);
+}
+
+function stopRoomRing(roomId, userId, reason = 'answered') {
   const ring = roomRings.get(roomId);
-  if (!ring) return;
+  if (!ring || !ring.waiting.has(userId)) return;
   ring.waiting.delete(userId);
-  toUser(userId, { type: 'ring-cancel', room: roomId });
+  toUser(userId, { type: 'ring-cancel', room: roomId, reason });
+  pushTo([userId], { type: 'cancel', room: roomId, reason, from: ring.from, roomName: ring.roomName }, 120);
   if (!ring.waiting.size) { clearTimeout(ring.timer); roomRings.delete(roomId); }
 }
 
@@ -416,7 +463,7 @@ function leaveRoom(client) {
     rooms.delete(roomId);
     if (call && call.answered) calls.delete(roomId);
     const ring = roomRings.get(roomId);
-    if (ring) { for (const u of [...ring.waiting]) stopRoomRing(roomId, u); }
+    if (ring) { for (const u of [...ring.waiting.keys()]) stopRoomRing(roomId, u, 'cancelled'); }
   } else {
     for (const peer of room.values()) send(peer.socket, { type: 'peer-left', id: peerId });
   }
@@ -470,12 +517,8 @@ wss.on('connection', (socket) => {
           return;
         }
         // The person being called picked up.
-        if (call && !call.answered && user.id === call.callee.id) {
-          clearTimeout(call.timer);
-          call.answered = true;
-          toUser(call.callee.id, { type: 'ring-cancel', call: roomId });
-        }
-        stopRoomRing(roomId, user.id);
+        if (call && !call.answered && user.id === call.callee.id) answeredCall(roomId);
+        stopRoomRing(roomId, user.id, 'answered');
 
         leaveRoom(client);
         if (!rooms.has(roomId)) rooms.set(roomId, new Map());
@@ -515,6 +558,9 @@ wss.on('connection', (socket) => {
           if (!userSockets.has(me.id)) userSockets.set(me.id, new Set());
           userSockets.get(me.id).add(socket);
         }
+        // Whatever is ringing right now, so a phone that was asleep or
+        // offline shows live calls and drops ones that already ended.
+        if (me) send(socket, { type: 'rings', active: incomingFor(me.id) });
         const ids = (Array.isArray(msg.rooms) ? msg.rooms : [])
           .slice(0, 100)
           .map((r) => String(r).toUpperCase())
@@ -561,13 +607,18 @@ wss.on('connection', (socket) => {
           caller: { id: me.id, name: me.username },
           callee: { id: to, name: calleeName },
           answered: false,
+          key: newKey(),
+          expiresAt: Date.now() + RING_MS,
         };
         call.timer = setTimeout(() => endRinging(callId, 'no-answer'), RING_MS);
         calls.set(callId, call);
 
         send(socket, { type: 'ringing', call: callId, to: calleeName });
-        toUser(to, { type: 'incoming', call: callId, from: me.username, kind: 'direct' });
-        pushTo([to], 'ring', { call: callId, from: me.username });
+        toUser(to, { type: 'incoming', call: callId, from: me.username, kind: 'direct', expiresAt: call.expiresAt });
+        pushTo([to], {
+          type: 'ring', kind: 'direct', call: callId, from: me.username,
+          expiresAt: call.expiresAt, keys: { [to]: call.key },
+        }, Math.ceil(RING_MS / 1000));
         console.log(`[call] ${me.username} -> ${calleeName}`);
         break;
       }
@@ -591,18 +642,23 @@ wss.on('connection', (socket) => {
 
         const prev = roomRings.get(roomId);
         if (prev) clearTimeout(prev.timer);
-        const ring = { from: me.username, roomName, waiting: new Set(targets) };
+        const ring = {
+          from: me.username, roomName,
+          waiting: new Map(targets.map((u) => [u, newKey()])),
+          expiresAt: Date.now() + RING_MS,
+        };
         ring.timer = setTimeout(() => {
-          const left = [...ring.waiting];
-          for (const u of left) stopRoomRing(roomId, u);
-          pushTo(left, 'missed', { room: roomId, roomName, from: me.username });
+          for (const u of [...ring.waiting.keys()]) stopRoomRing(roomId, u, 'no-answer');
         }, RING_MS);
         roomRings.set(roomId, ring);
 
         for (const u of targets) {
-          toUser(u, { type: 'incoming', room: roomId, roomName, from: me.username, kind: 'room' });
+          toUser(u, { type: 'incoming', room: roomId, roomName, from: me.username, kind: 'room', expiresAt: ring.expiresAt });
         }
-        pushTo(targets, 'ring', { room: roomId, roomName, from: me.username });
+        pushTo(targets, {
+          type: 'ring', kind: 'room', room: roomId, roomName, from: me.username,
+          expiresAt: ring.expiresAt, keys: Object.fromEntries(ring.waiting),
+        }, Math.ceil(RING_MS / 1000));
         send(socket, { type: 'ringing-room', room: roomId, count: targets.length });
         console.log(`[ring] ${me.username} rang ${targets.length} in ${roomName}`);
         break;
@@ -615,7 +671,7 @@ wss.on('connection', (socket) => {
         const call = calls.get(callId);
         if (call && call.callee.id === me.id) endRinging(callId, 'declined');
         const roomId = String(msg.room || '').toUpperCase();
-        if (roomRings.has(roomId)) stopRoomRing(roomId, me.id);
+        if (roomRings.has(roomId)) stopRoomRing(roomId, me.id, 'declined');
         break;
       }
 
