@@ -557,6 +557,20 @@ input[type=password]{
 }
 .danger:hover{background:rgba(255,107,91,.1)}
 
+/* ------------------------------------------- picture-in-picture window
+   The floating window is tiny. Show the other person's video edge to
+   edge and nothing else; tap the window to get the full controls back. */
+@media (max-width:300px){
+  #call .topbar,#call .controls,.toast{display:none!important}
+  #call .grid{padding:0;gap:0;grid-template-columns:1fr!important;align-content:stretch}
+  #call .tile{border:none;border-radius:0;aspect-ratio:auto;min-height:100%}
+  #call .tile::after{border-radius:0}
+  #call .grid:not([data-n="1"]) .tile.self{display:none}
+  #call .tile-foot{padding:14px 8px 6px}
+  #call .who{font-size:11px}
+  #call .readout{display:none}
+}
+
 @media (prefers-reduced-motion:reduce){
   *{animation:none!important;transition:none!important}
 }
@@ -1384,6 +1398,9 @@ function enterCall() {
   }
   updateFlipButton();
   startBackgroundCall();
+  // Tells the Android app to shrink into a floating window, not vanish,
+  // when you leave it mid-call.
+  document.title = "GMST \u00b7 In call";
   if (state.calling) startRingback();
   paintControls();
   updateCount();
