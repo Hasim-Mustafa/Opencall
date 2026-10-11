@@ -155,19 +155,20 @@ async function dropPushToken(token) {
  *           nobody answered); turns into "Missed call" where that fits
  */
 async function pushTo(userIds, data, ttlSeconds) {
-  if (!userIds.length) return;
+  if (!userIds.length) return { status: 'none' };
   if (!FCM_SA || !SUPABASE_SECRET) {
     if (data.type === 'ring') console.log('[push] ring not sent: ringing closed apps is off (check FCM_SERVICE_ACCOUNT and SUPABASE_SECRET_KEY)');
-    return;
+    return { status: 'off' };
   }
   try {
     const rows = await pushTokensFor(userIds);
     if (!rows.length) {
       console.log(`[push] ${data.type} not sent: no phones registered for that person (they need the newest APK, opened once, with notifications allowed)`);
-      return;
+      return { status: 'no-phones' };
     }
     const access = await fcmAccessToken();
     let sent = 0;
+    let refused = '';
     await Promise.all(rows.map(async ({ token, user_id }) => {
       const payload = { ...data };
       // Each person gets their own key to decline from the notification.
@@ -186,12 +187,15 @@ async function pushTo(userIds, data, ttlSeconds) {
       } else {
         const t = await res.text();
         console.error(`[push] Google refused the ${data.type} (${res.status}): ${t.slice(0, 200)}`);
+        refused = `${res.status} ${t.slice(0, 160)}`;
         if (/UNREGISTERED|INVALID_ARGUMENT.*token/i.test(t)) dropPushToken(token);
       }
     }));
     console.log(`[push] ${data.type} delivered to Google for ${sent} of ${rows.length} phone(s)`);
+    return sent ? { status: 'delivered', phones: rows.length, sent } : { status: 'refused', phones: rows.length, detail: refused };
   } catch (err) {
     console.error('[push] failed:', err.message);
+    return { status: 'error', detail: err.message };
   }
 }
 
@@ -357,6 +361,9 @@ const userSockets = new Map();
  * callee:{id,name}, answered, timer }
  */
 const calls = new Map();
+/** userId -> result of their most recent test ring */
+const lastTest = new Map();
+
 /** Group rings. roomId -> { from, roomName, waiting:Map<userId, declineKey>, timer, expiresAt } */
 const roomRings = new Map();
 
@@ -571,6 +578,10 @@ wss.on('connection', (socket) => {
         // Whatever is ringing right now, so a phone that was asleep or
         // offline shows live calls and drops ones that already ended.
         if (me) send(socket, { type: 'rings', active: incomingFor(me.id) });
+        if (me && lastTest.has(me.id)) {
+          send(socket, { type: 'test-ring', ...lastTest.get(me.id), final: true, earlier: true });
+          lastTest.delete(me.id);
+        }
         const ids = (Array.isArray(msg.rooms) ? msg.rooms : [])
           .slice(0, 100)
           .map((r) => String(r).toUpperCase())
@@ -671,6 +682,41 @@ wss.on('connection', (socket) => {
         }, Math.ceil(RING_MS / 1000));
         send(socket, { type: 'ringing-room', room: roomId, count: targets.length });
         console.log(`[ring] ${me.username} rang ${targets.length} in ${roomName}`);
+        break;
+      }
+
+      // "Test ringing": checks this person's setup, then rings their own
+      // phone a few seconds later so they can close the app and watch.
+      case 'test-ring': {
+        const me = await verifyUser(msg.token);
+        if (!me) return;
+        if (!FCM_SA || !SUPABASE_SECRET) {
+          send(socket, { type: 'test-ring', status: 'off' });
+          return;
+        }
+        let phones = [];
+        try { phones = await pushTokensFor([me.id]); } catch (err) {
+          send(socket, { type: 'test-ring', status: 'error', detail: err.message });
+          return;
+        }
+        if (!phones.length) {
+          send(socket, { type: 'test-ring', status: 'no-phones' });
+          return;
+        }
+        const delay = 10000;
+        send(socket, { type: 'test-ring', status: 'scheduled', phones: phones.length, inSeconds: delay / 1000 });
+        const callId = 'TEST-' + crypto.randomUUID().toUpperCase();
+        setTimeout(async () => {
+          const expiresAt = Date.now() + 25000;
+          const result = await pushTo([me.id], {
+            type: 'ring', kind: 'direct', call: callId, from: 'gmst_test', expiresAt, keys: {},
+          }, 25);
+          // Still connected: tell them now. Closed the app: tell them next time.
+          if (socket.readyState === socket.OPEN) send(socket, { type: 'test-ring', ...result, final: true });
+          else lastTest.set(me.id, { ...result, at: Date.now() });
+          setTimeout(() => pushTo([me.id], { type: 'cancel', call: callId, reason: 'test' }, 60), 25000);
+        }, delay);
+        console.log(`[test] ${me.username} asked for a test ring (${phones.length} phone(s))`);
         break;
       }
 
