@@ -567,6 +567,18 @@ input[type=password]{
   font-family:var(--display);font-weight:700;font-size:14px;
 }
 .danger:hover{background:rgba(255,107,91,.1)}
+.check{display:flex;align-items:center;gap:12px;padding:12px 2px;border-bottom:1px solid var(--line)}
+.check:last-of-type{border-bottom:none}
+.check .mark{width:22px;height:22px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700}
+.check.ok .mark{background:rgba(61,217,164,.15);color:var(--live)}
+.check.bad .mark{background:rgba(255,107,91,.15);color:var(--drop)}
+.check span{flex:1;min-width:0}
+.check b{display:block;font-weight:500;font-size:14px}
+.check small{display:block;font-size:12px;color:var(--muted);margin-top:2px;line-height:1.45}
+.test-result{margin-top:14px;padding:12px 14px;border-radius:10px;font-size:13px;line-height:1.55;background:var(--panel-2);border:1px solid var(--line)}
+.test-result.ok{border-color:rgba(61,217,164,.45)}
+.test-result.bad{border-color:rgba(255,107,91,.45)}
+.test-result:empty{display:none}
 
 /* ------------------------------------------- picture-in-picture window
    The floating window is tiny. Show the other person's video edge to
@@ -627,7 +639,7 @@ input[type=password]{
     <div class="wordmark"><span class="dot"></span>GMST</div>
     <div class="me">
       <span class="me-name" id="meName"></span>
-      <button class="mini" id="signOut">Sign out</button>
+      <button class="mini" id="settingsBtn">Settings</button>
     </div>
   </header>
 
@@ -824,7 +836,7 @@ input[type=password]{
     <label class="switch-row" id="pipRow" hidden>
       <span>
         <b>Floating window</b>
-        <small>Show the call in a small window when you leave the app. Off: the call keeps going in the background with just a notification.</small>
+        <small>Off: leaving the app keeps the call going, shown as an ongoing call in your notifications. On: the call shrinks into a small window instead. Closing that window ends the call, so drag it to the side of the screen to tuck it away.</small>
       </span>
       <input type="checkbox" id="pipToggle">
       <i aria-hidden="true"></i>
@@ -1187,16 +1199,16 @@ async function swapDevice(kind, choice) {
 
 async function setSpeaker(id) {
   state.pref.output = id;
-  const targets = document.querySelectorAll(".tile:not(.self) video");
+  const targets = document.querySelectorAll(".tile:not(.self) audio");
   for (const v of targets) {
     try { await v.setSinkId(id === "default" ? "" : id); } catch (e) { console.warn(e); }
   }
   await listDevices();
 }
 
-function applySinkTo(video) {
+function applySinkTo(el) {
   if (CAN_PICK_SPEAKER && state.pref.output !== "default") {
-    video.setSinkId(state.pref.output).catch(console.warn);
+    el.setSinkId(state.pref.output).catch(console.warn);
   }
 }
 
@@ -1525,8 +1537,22 @@ $("secBack").onclick = (e) => { if (e.target.id === "secBack") $("secBack").hidd
 const Native = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()
   ? window.Capacitor : null;
 const FGS = Native && Native.registerPlugin ? Native.registerPlugin("ForegroundService") : null;
+// GMST's own call service (newer APKs): keeps the call alive in the
+// background and shows it as an ongoing call in the status bar.
+const CallNative = Native && Native.registerPlugin ? Native.registerPlugin("GmstCall") : null;
 
 async function startBackgroundCall() {
+  if (CallNative) {
+    try {
+      await CallNative.start({ title: state.roomName || "GMST call" });
+      if (!state.hangupListener) {
+        state.hangupListener = await CallNative.addListener("hangup", () => $("btnLeave").click());
+      }
+      return;
+    } catch (e) {
+      // Older APK without GMST's call service: use the one it has.
+    }
+  }
   if (!FGS) return;
   try {
     const perm = await FGS.checkPermissions();
@@ -1555,8 +1581,8 @@ async function startBackgroundCall() {
 }
 
 async function stopBackgroundCall() {
-  if (!FGS) return;
-  try { await FGS.stopForegroundService(); } catch {}
+  if (CallNative) { try { await CallNative.stop(); } catch {} }
+  if (FGS) { try { await FGS.stopForegroundService(); } catch {} }
 }
 
 // A crash or forced reload could leave the notification behind.
@@ -1638,7 +1664,7 @@ document.addEventListener("visibilitychange", async () => {
     broadcastState();
   }
 
-  document.querySelectorAll("video").forEach((v) => v.paused && v.play().catch(() => {}));
+  document.querySelectorAll("video, audio").forEach((v) => v.paused && v.play().catch(() => {}));
 
   const wsDead = !state.ws || state.ws.readyState > 1;
   if (state.needsRejoin || wsDead || peersBroken()) {
@@ -1674,12 +1700,30 @@ function createPeer(id, name) {
     if (e.candidate) sendTo(id, { candidate: e.candidate });
   };
 
+  // Video plays muted; the sound goes through its own audio element, which
+  // Android keeps playing when the app is in the background.
   pc.ontrack = (e) => {
+    const stream = e.streams[0];
     const video = tile.querySelector("video");
-    if (video.srcObject !== e.streams[0]) {
-      video.srcObject = e.streams[0];
-      applySinkTo(video);
-      attachRing(tile, e.streams[0]);
+    if (video.srcObject !== stream) {
+      video.srcObject = stream;
+      video.muted = true;
+      attachRing(tile, stream);
+    }
+    const tracks = stream.getAudioTracks();
+    if (tracks.length) {
+      let audio = tile.querySelector("audio");
+      if (!audio) {
+        audio = document.createElement("audio");
+        audio.autoplay = true;
+        tile.appendChild(audio);
+      }
+      const current = audio.srcObject && audio.srcObject.getAudioTracks()[0];
+      if (current !== tracks[0]) {
+        audio.srcObject = new MediaStream(tracks);
+        applySinkTo(audio);
+        audio.play().catch(() => {});
+      }
     }
     tile.classList.remove("novideo");
   };
@@ -1746,7 +1790,7 @@ function sendTo(id, data) {
 /* The Android app reads the page title to decide whether leaving the app
    should shrink the call into a floating window. */
 const PIP_KEY = "gmst.pip";
-const pipOn = () => { try { return localStorage.getItem(PIP_KEY) !== "off"; } catch { return true; } };
+const pipOn = () => { try { return localStorage.getItem(PIP_KEY) === "on"; } catch { return false; } };
 function applyCallTitle() {
   document.title = pipOn() ? "GMST \u00b7 In call" : "GMST \u00b7 Call (background)";
 }
@@ -2177,10 +2221,14 @@ if ("serviceWorker" in navigator) {
     checkNative();
   }
 
-  $("signOut").onclick = async () => {
+  async function signOut() {
+    // This phone stops ringing for this account.
+    if (app.pushToken) {
+      try { await sb.from("push_tokens").delete().eq("token", app.pushToken); } catch {}
+    }
     await sb.auth.signOut();
     location.reload();
-  };
+  }
 
   // --------------------------------------------------------------- data
 
@@ -2280,6 +2328,7 @@ if ("serviceWorker" in navigator) {
         case "incoming": showIncoming(m); break;
         case "ring-cancel": cancelIncoming(m); break;
         case "rings": syncIncoming(m.active || []); break;
+        case "test-ring": showTestResult(m); break;
         case "ringing": joinCall(m.call, "@" + m.to, true); break;
         case "ringing-room": toast(`Ringing ${m.count} ${m.count === 1 ? "person" : "people"}`); break;
         case "ring-failed":
@@ -2761,6 +2810,13 @@ if ("serviceWorker" in navigator) {
     let a;
     try { a = JSON.parse(raw); } catch { return; }
     if (!a || Date.now() - (a.at || 0) > 90000) return; // stale
+    if ((a.call || "").startsWith("TEST-")) {
+      clearNativeRing(a);
+      openModal("Ringing works", `<p class="share-note" style="margin-top:6px">That was the test call. Friends' calls will reach this phone the same way, even with GMST closed.</p>
+        <button class="enter" id="testDone">Done</button>`);
+      $("testDone").onclick = closeModal;
+      return;
+    }
     if (a.action === "accept") {
       nativePending = a;
       hideIncoming();
@@ -2866,6 +2922,94 @@ if ("serviceWorker" in navigator) {
       await Push.register();
     } catch (e) {
       console.warn("Push notifications unavailable:", e);
+    }
+  }
+
+  // ------------------------------------------------- settings & ringing
+
+  const OEM_AUTOSTART = /xiaomi|redmi|poco|huawei|honor|oppo|realme|vivo|oneplus|tecno|infinix|itel/i;
+  let settingsOpen = false;
+
+  async function ringingChecks() {
+    if (!CallNative) return null;
+    try { return await CallNative.status(); } catch { return null; }
+  }
+
+  const checkRow = (ok, title, note, fix) => `
+    <div class="check ${ok ? "ok" : "bad"}">
+      <span class="mark">${ok ? "&#10003;" : "!"}</span>
+      <span><b>${title}</b><small>${note}</small></span>
+      ${ok || !fix ? "" : `<button class="mini solid" data-fix="${fix}">Fix</button>`}
+    </div>`;
+
+  async function openSettings() {
+    settingsOpen = true;
+    const s = await ringingChecks();
+    const registered = !!app.pushToken;
+    let html = `<div class="sub-label">Account</div>
+      <div class="person"><span class="av">${initial(app.username)}</span><b>@${escapeHtml(app.username)}</b>
+      <button class="mini" id="signOutBtn">Sign out</button></div>`;
+
+    html += `<div class="sub-label">Calls ringing when GMST is closed</div>`;
+    if (!Native) {
+      html += `<p class="share-note" style="margin-top:4px">That works in the GMST Android app. In a browser, calls ring while this page is open.</p>`;
+    } else if (!s) {
+      html += `<p class="share-note" style="margin-top:4px">This copy of the app is out of date. Install the newest GMST.apk to get ringing with the app closed.</p>`;
+    } else {
+      html += checkRow(s.notifications, "Notifications", s.notifications ? "Allowed" : "Off, so calls can't ring", "notifications");
+      html += checkRow(registered, "Registered for calls", registered ? "Friends can ring this phone" : "Waiting. Allow notifications, then reopen GMST", null);
+      html += checkRow(s.fullScreen, "Full-screen calls", s.fullScreen ? "Calls show over the lock screen" : "Calls only show as a notification", "fullscreen");
+      html += checkRow(s.battery, "Battery: unrestricted", s.battery ? "Android won't put GMST to sleep" : "Android may block calls while GMST is closed", "battery");
+      if (OEM_AUTOSTART.test(s.manufacturer || "")) {
+        html += `<p class="share-note">On ${escapeHtml(s.manufacturer)} phones, also turn on <b>Autostart</b> for GMST in your phone's app settings, or swiping GMST away stops it ringing.</p>`;
+      }
+      html += `<button class="enter" id="testRingBtn" style="margin-top:18px">Test ringing</button>
+        <div class="test-result" id="testRingResult"></div>`;
+    }
+    openModal("Settings", html);
+    $("signOutBtn").onclick = signOut;
+    $("modalBody").querySelectorAll("[data-fix]").forEach((b) => (b.onclick = () => {
+      CallNative.openSettings({ which: b.dataset.fix }).catch(() => {});
+    }));
+    const t = $("testRingBtn");
+    if (t) t.onclick = () => {
+      if (sendHome({ type: "test-ring" })) {
+        t.disabled = true;
+        showTestResult({ status: "asking" });
+      }
+    };
+  }
+  $("settingsBtn").onclick = openSettings;
+  $("modalClose").addEventListener("click", () => (settingsOpen = false));
+
+  // Coming back from Android's settings: refresh the ticks.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && settingsOpen && !$("modal").hidden && $("testRingBtn")) openSettings();
+  });
+
+  function showTestResult(r) {
+    if (r.status === "delivered" && r.final && !r.earlier && !document.hidden) {
+      r = { ...r, status: "still-open" };
+    }
+    const text = {
+      "still-open": ["bad", "GMST was still open, so the phone didn't ring. Tap Test ringing again, then close GMST straight away."],
+      asking: ["", "Checking…"],
+      scheduled: ["ok", `All set on this end. <b>Close GMST now</b> (swipe it away from recent apps). Your phone will ring in ${r.inSeconds || 10} seconds.`],
+      off: ["bad", "The server isn't set up for ringing yet. In Render, check the FCM_SERVICE_ACCOUNT and SUPABASE_SECRET_KEY settings."],
+      "no-phones": ["bad", "This phone isn't registered for calls yet. Allow notifications, then close and reopen GMST."],
+      delivered: ["ok", "The test call was handed to Google for this phone. If it didn't ring, the phone blocked it: fix any red items above, and on Xiaomi, Huawei, Oppo and similar phones turn on Autostart."],
+      refused: ["bad", `Google rejected the test call: ${escapeHtml(r.detail || "unknown reason")}. This usually means the Firebase key in Render belongs to a different project.`],
+      error: ["bad", `Something went wrong on the server: ${escapeHtml(r.detail || "")}`],
+    }[r.status];
+    if (!text) return;
+    const box = $("testRingResult");
+    if (box && !$("modal").hidden) {
+      box.className = "test-result " + text[0];
+      box.innerHTML = text[1];
+      if (r.final && $("testRingBtn")) $("testRingBtn").disabled = false;
+      if (r.status !== "scheduled" && r.status !== "asking" && $("testRingBtn")) $("testRingBtn").disabled = false;
+    } else if (r.final) {
+      openSettings().then(() => showTestResult({ ...r, final: true }));
     }
   }
 
