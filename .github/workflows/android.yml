@@ -133,6 +133,8 @@ jobs:
       # over the lock screen, Decline and Hang up from notifications, and the
       # optional floating window. The push part is added only with Firebase.
       - name: Native call code
+        env:
+          FIREBASE: ${{ steps.firebase.outputs.enabled }}
         run: |
           dir=$(dirname "$(find android/app/src/main/java -name MainActivity.java | head -1)")
           echo "Writing native code into $dir"
@@ -847,12 +849,12 @@ jobs:
               }
           }
           JAVA
-          if [ "${{ steps.firebase.outputs.enabled }}" = "true" ]; then
+          if [ "$FIREBASE" = "true" ]; then
             mv /tmp/CallMessagingService.java "$dir/CallMessagingService.java"
             printf '\ndependencies {\n    implementation "com.google.firebase:firebase-messaging:25.0.1"\n}\n' >> android/app/build.gradle
           fi
           ls "$dir"
-          FIREBASE="${{ steps.firebase.outputs.enabled }}" python3 - <<'PY2'
+          python3 - <<'PY2'
           import os, pathlib, re
           p = pathlib.Path('android/app/src/main/AndroidManifest.xml')
           xml = p.read_text()
