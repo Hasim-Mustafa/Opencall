@@ -64,7 +64,6 @@ jobs:
           npm install
           npm install \
             @capacitor/core@8 @capacitor/cli@8 @capacitor/android@8 \
-            @capawesome-team/capacitor-android-foreground-service@8 \
             @capacitor/preferences@8
           if [ "${{ steps.firebase.outputs.enabled }}" = "true" ]; then
             npm install @capacitor/push-notifications@8
@@ -98,7 +97,7 @@ jobs:
       # Only what a calling app needs: camera, microphone, network,
       # notifications, and the background call service. No contacts,
       # storage, location, SMS or screen overlay.
-      - name: Permissions, background service, backup off
+      - name: Permissions and backup off
         run: |
           python3 - <<'PY'
           import pathlib, re
@@ -121,13 +120,6 @@ jobs:
           if 'FOREGROUND_SERVICE_MICROPHONE' not in xml:
               xml = xml.replace('</manifest>', perms + '\n</manifest>')
 
-          service = """
-                  <receiver android:name="io.capawesome.capacitorjs.plugins.foregroundservice.NotificationActionBroadcastReceiver" android:exported="false" />
-                  <service android:name="io.capawesome.capacitorjs.plugins.foregroundservice.AndroidForegroundService" android:exported="false" android:foregroundServiceType="microphone" />
-          """
-          if 'AndroidForegroundService' not in xml:
-              xml = xml.replace('</application>', service + '\n    </application>')
-
           xml = re.sub(r'android:allowBackup="true"', 'android:allowBackup="false"', xml)
           if 'android:allowBackup' not in xml:
               xml = xml.replace('<application', '<application android:allowBackup="false"', 1)
@@ -136,9 +128,10 @@ jobs:
           print(xml)
           PY
 
-      # The phone's own call code: picture-in-picture, the incoming-call
-      # screen that rings over the lock screen, and Decline from the
-      # notification. The push part is added only when Firebase is set up.
+      # The phone's own call code: the ongoing-call notification that keeps a
+      # call alive in the background, the incoming-call screen that rings
+      # over the lock screen, Decline and Hang up from notifications, and the
+      # optional floating window. The push part is added only with Firebase.
       - name: Native call code
         run: |
           dir=$(dirname "$(find android/app/src/main/java -name MainActivity.java | head -1)")
@@ -162,8 +155,8 @@ jobs:
 
           /**
            * GMST's main screen, with three call behaviours added:
-           *  - Picture-in-picture: leaving the app mid-call shrinks it into a floating
-           *    window (if that's switched on in the call settings).
+           *  - Leaving the app mid-call keeps it running with an ongoing-call
+           *    notification, or shrinks it into a floating window if that's switched on.
            *  - Incoming calls open straight over the lock screen.
            *  - Accepting from the notification hands the call to the app.
            */
@@ -179,8 +172,27 @@ jobs:
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(GmstCallPlugin.class);
                   super.onCreate(savedInstanceState);
+                  // Keep the call's engine at full priority while GMST is in the background.
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      try {
+                          getBridge().getWebView().setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+                      } catch (Exception ignored) {
+                      }
+                  }
                   handleCallIntent(getIntent());
+              }
+
+              /**
+               * The call lives in this screen. If Android destroys it (app swiped away,
+               * or the floating window closed), the call is over, so don't leave an
+               * "ongoing call" notification behind.
+               */
+              @Override
+              public void onDestroy() {
+                  CallService.stop(this);
+                  super.onDestroy();
               }
 
               @Override
@@ -293,6 +305,242 @@ jobs:
 
               private static String nz(String s) {
                   return s == null ? "" : s;
+              }
+          }
+          JAVA
+          cat > "$dir/CallService.java" <<'JAVA'
+          package com.hasim.opencall;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Person;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.drawable.Icon;
+          import android.os.Build;
+          import android.os.IBinder;
+
+          /**
+           * Keeps a call alive while GMST is in the background, and shows it in the
+           * status bar as an ongoing call: app icon, call timer, Hang up, and tap to
+           * go back. Android also treats it as "in a call", so it keeps the
+           * microphone working while you use other apps.
+           */
+          public class CallService extends Service {
+
+              static final String ACTION_START = "com.hasim.opencall.CALL_START";
+              static final String ACTION_STOP = "com.hasim.opencall.CALL_STOP";
+              static final String CHANNEL = "gmst_ongoing_call";
+              static final int NOTIFICATION_ID = 7100;
+
+              private long startedAt = 0;
+
+              static void start(Context ctx, String title) {
+                  Intent i = new Intent(ctx, CallService.class).setAction(ACTION_START).putExtra("title", title);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      ctx.startForegroundService(i);
+                  } else {
+                      ctx.startService(i);
+                  }
+              }
+
+              static void stop(Context ctx) {
+                  ctx.stopService(new Intent(ctx, CallService.class));
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent == null || ACTION_STOP.equals(intent.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  if (startedAt == 0) startedAt = System.currentTimeMillis();
+                  String title = intent.getStringExtra("title");
+                  Notification n = build(title == null || title.isEmpty() ? "GMST call" : title);
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+                      } else {
+                          startForeground(NOTIFICATION_ID, n);
+                      }
+                  } catch (Exception e) {
+                      // Android refused (for example, microphone permission missing).
+                      stopSelf();
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              /** Swiping GMST away from recent apps closes the call screen, so the call is over. */
+              @Override
+              public void onTaskRemoved(Intent rootIntent) {
+                  super.onTaskRemoved(rootIntent);
+                  stopSelf();
+              }
+
+              @Override
+              public void onDestroy() {
+                  super.onDestroy();
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                      stopForeground(STOP_FOREGROUND_REMOVE);
+                  } else {
+                      stopForeground(true);
+                  }
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              private void ensureChannel() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm.getNotificationChannel(CHANNEL) != null) return;
+                  NotificationChannel ch = new NotificationChannel(CHANNEL, "Ongoing call", NotificationManager.IMPORTANCE_LOW);
+                  ch.setDescription("Shown while you're in a call");
+                  ch.setSound(null, null);
+                  ch.enableVibration(false);
+                  ch.setShowBadge(false);
+                  nm.createNotificationChannel(ch);
+              }
+
+              @SuppressWarnings("deprecation")
+              private Notification build(String title) {
+                  ensureChannel();
+                  int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+                  Intent back = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  PendingIntent open = PendingIntent.getActivity(this, 7101, back, flags);
+                  PendingIntent hangUp = PendingIntent.getBroadcast(this, 7102,
+                      new Intent(this, CallActionReceiver.class).setAction(CallActionReceiver.ACTION_HANGUP), flags);
+
+                  Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                      ? new Notification.Builder(this, CHANNEL)
+                      : new Notification.Builder(this);
+                  int icon = getResources().getIdentifier("ic_stat_gmst", "drawable", getPackageName());
+                  b.setSmallIcon(icon != 0 ? icon : getApplicationInfo().icon)
+                      .setContentTitle(title)
+                      .setContentText("Ongoing call · tap to return")
+                      .setCategory(Notification.CATEGORY_CALL)
+                      .setOngoing(true)
+                      .setOnlyAlertOnce(true)
+                      .setShowWhen(true)
+                      .setWhen(startedAt)
+                      .setUsesChronometer(true)
+                      .setColor(0xFF22B573)
+                      .setVisibility(Notification.VISIBILITY_PUBLIC)
+                      .setContentIntent(open);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+                  }
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      try {
+                          Person who = new Person.Builder().setName(title).setImportant(true).build();
+                          b.setStyle(Notification.CallStyle.forOngoingCall(who, hangUp));
+                          return b.build();
+                      } catch (Exception ignored) {
+                          // Fall through to the plain version.
+                      }
+                  }
+                  b.setStyle(null);
+                  b.addAction(new Notification.Action.Builder((Icon) null, "Hang up", hangUp).build());
+                  return b.build();
+              }
+          }
+          JAVA
+          cat > "$dir/GmstCallPlugin.java" <<'JAVA'
+          package com.hasim.opencall;
+
+          import android.app.NotificationManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.PowerManager;
+          import android.provider.Settings;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          /** What the app's page uses to control calls and check ringing settings. */
+          @CapacitorPlugin(name = "GmstCall")
+          public class GmstCallPlugin extends Plugin {
+
+              private static GmstCallPlugin instance;
+
+              @Override
+              public void load() {
+                  instance = this;
+              }
+
+              /** Called when Hang up is tapped on the ongoing-call notification. */
+              static void fireHangup() {
+                  GmstCallPlugin p = instance;
+                  if (p != null) p.notifyListeners("hangup", new JSObject());
+              }
+
+              @PluginMethod
+              public void start(PluginCall call) {
+                  try {
+                      CallService.start(getContext(), call.getString("title", "GMST call"));
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject(e.getMessage());
+                  }
+              }
+
+              @PluginMethod
+              public void stop(PluginCall call) {
+                  CallService.stop(getContext());
+                  call.resolve();
+              }
+
+              /** Everything Android needs allowed for calls to ring with the app closed. */
+              @PluginMethod
+              public void status(PluginCall call) {
+                  Context ctx = getContext();
+                  NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                  boolean notifications = Build.VERSION.SDK_INT < Build.VERSION_CODES.N || nm.areNotificationsEnabled();
+                  boolean fullScreen = Build.VERSION.SDK_INT < 34 || nm.canUseFullScreenIntent();
+                  PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+                  boolean battery = pm.isIgnoringBatteryOptimizations(ctx.getPackageName());
+                  JSObject r = new JSObject();
+                  r.put("notifications", notifications);
+                  r.put("fullScreen", fullScreen);
+                  r.put("battery", battery);
+                  r.put("manufacturer", Build.MANUFACTURER);
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void openSettings(PluginCall call) {
+                  Context ctx = getContext();
+                  String pkg = ctx.getPackageName();
+                  String which = call.getString("which", "app");
+                  Intent i;
+                  if ("notifications".equals(which) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, pkg);
+                  } else if ("fullscreen".equals(which) && Build.VERSION.SDK_INT >= 34) {
+                      i = new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:" + pkg));
+                  } else if ("battery".equals(which)) {
+                      i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + pkg));
+                  } else {
+                      i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + pkg));
+                  }
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  try {
+                      ctx.startActivity(i);
+                  } catch (Exception e) {
+                      ctx.startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + pkg))
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                  }
+                  call.resolve();
               }
           }
           JAVA
@@ -516,14 +764,20 @@ jobs:
           import java.nio.charset.StandardCharsets;
           import org.json.JSONObject;
 
-          /** "Decline" on the incoming-call notification: works with the app closed. */
+          /** Decline (incoming call) and Hang up (ongoing call) from notifications. */
           public class CallActionReceiver extends BroadcastReceiver {
 
               static final String ACTION_DECLINE = "com.hasim.opencall.DECLINE";
+              static final String ACTION_HANGUP = "com.hasim.opencall.HANGUP";
               static final String SERVER = "__SERVER_URL__";
 
               @Override
               public void onReceive(Context ctx, Intent intent) {
+                  if (intent != null && ACTION_HANGUP.equals(intent.getAction())) {
+                      GmstCallPlugin.fireHangup();
+                      CallService.stop(ctx);
+                      return;
+                  }
                   if (intent == null || !ACTION_DECLINE.equals(intent.getAction())) return;
                   final String call = intent.getStringExtra("call");
                   final String room = intent.getStringExtra("room");
@@ -597,6 +851,7 @@ jobs:
             mv /tmp/CallMessagingService.java "$dir/CallMessagingService.java"
             printf '\ndependencies {\n    implementation "com.google.firebase:firebase-messaging:25.0.1"\n}\n' >> android/app/build.gradle
           fi
+          ls "$dir"
           FIREBASE="${{ steps.firebase.outputs.enabled }}" python3 - <<'PY2'
           import os, pathlib, re
           p = pathlib.Path('android/app/src/main/AndroidManifest.xml')
@@ -609,11 +864,15 @@ jobs:
           extra_perms = """
               <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
               <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
           """
           if 'USE_FULL_SCREEN_INTENT' not in xml:
               xml = xml.replace('</manifest>', extra_perms + '\n</manifest>')
 
-          parts = ['        <receiver android:name="com.hasim.opencall.CallActionReceiver" android:exported="false" />']
+          parts = [
+              '        <receiver android:name="com.hasim.opencall.CallActionReceiver" android:exported="false" />',
+              '        <service android:name="com.hasim.opencall.CallService" android:exported="false" android:foregroundServiceType="microphone" />',
+          ]
           if os.environ.get('FIREBASE') == 'true':
               if 'xmlns:tools=' not in xml:
                   xml = xml.replace('<manifest ', '<manifest xmlns:tools="http://schemas.android.com/tools" ', 1)
